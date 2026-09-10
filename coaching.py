@@ -8,9 +8,14 @@ AI 처리 설계(팀플.md 7장)의 규칙 기반 구현.
 4. 출처 ID·허용 링크·출력 형식 서버 검증
 5. 근거가 없으면 "확인 필요"로 표시 (지어내지 않음)
 
-실제 API 연결 시에는 build_response의 templates 딕셔너리 부분만
-LLM 호출로 교체하면 되고, 검증/스키마/그라운딩 로직은 그대로 재사용된다.
+LLM_API_KEY가 설정되면(3번) 근거 문장을 그대로 보여주는 대신, 그 근거만 사용해
+쉬운 말로 풀어 설명하도록 LLM에 요청한다. LLM 호출이 실패하거나 키가 없으면
+근거 문장을 그대로 사용해 항상 답변 가능하게 한다(API 장애에도 기본 안내는
+계속 제공되어야 한다는 검수 기준을 만족).
 """
+
+from config import llm_configured
+from llm_client import generate_text
 
 INTENT_PATTERNS = [
     ("일정_변경", ["일정 변경", "날짜를 바꿔", "미루고 싶어", "당기고 싶어", "연기"]),
@@ -65,6 +70,27 @@ def validate_response(conn, response: dict) -> dict:
     return response
 
 
+def _llm_explain(question: str, grounding_fact: str, task_title: str):
+    """근거 문장만 재료로 주고 쉬운 말로 풀어달라고 LLM에 요청한다.
+    실패하면 None을 반환해 호출부가 근거 문장 그대로 폴백하게 한다."""
+    system_instruction = (
+        "당신은 폐업을 준비하는 소상공인을 돕는 코칭 챗봇입니다. "
+        "아래 '근거 정보'에 있는 사실만 사용해서 쉬운 한국어로 2~4문장으로 설명하세요. "
+        "근거에 없는 서류명, 금액, 조건, 절차, 기한을 지어내지 마세요. "
+        "근거만으로 답할 수 없는 부분은 '확인이 필요합니다'라고 답하세요."
+    )
+    prompt = (
+        f"업무: {task_title}\n"
+        f"사용자 질문: {question}\n"
+        f"근거 정보: {grounding_fact}\n\n"
+        "위 근거 정보만 바탕으로 사용자 질문에 답해주세요."
+    )
+    result = generate_text(prompt, system_instruction=system_instruction)
+    if result["ok"] and result["text"]:
+        return result["text"].strip()
+    return None
+
+
 def build_response(conn, intent: str, task_row: dict, question: str) -> dict:
     source_id = task_row.get("source_id")
     source = None
@@ -104,7 +130,15 @@ def build_response(conn, intent: str, task_row: dict, question: str) -> dict:
         "판매_글_생성": "집기 판매 글은 '내 집기' 화면에서 생성할 수 있습니다.",
         "상황_등록": "현재 상황 정보는 이미 등록되어 있습니다. 변경이 필요하면 알려주세요.",
     }
-    answer = templates.get(intent, "해당 질문에 대한 검토된 답변이 아직 준비되지 않았습니다. 확인이 필요합니다.")
+    grounding_fact = templates.get(intent, "해당 질문에 대한 검토된 답변이 아직 준비되지 않았습니다. 확인이 필요합니다.")
+
+    answer = grounding_fact
+    if llm_configured():
+        llm_text = _llm_explain(question, grounding_fact, task_row["task_title"])
+        if llm_text:
+            answer = llm_text
+        else:
+            answer = f"{grounding_fact}\n\n*(LLM 응답을 받지 못해 기본 안내로 대신합니다.)*"
 
     response = {
         "intent": intent,

@@ -25,9 +25,13 @@ _load_dotenv()
 # 기업마당 지원사업정보 API 서비스키 (crtfcKey)
 BIZINFO_API_KEY = os.environ.get("BIZINFO_API_KEY")
 
-# LLM 공급자 결정 후 채운다. 예: "anthropic", "gemini", "openai" (아직 미확정)
+# LLM 공급자. 예: "anthropic", "gemini", "openai"
 LLM_PROVIDER = os.environ.get("LLM_PROVIDER")
 LLM_API_KEY = os.environ.get("LLM_API_KEY")
+# 모델명은 하드코딩하지 않고 환경변수로 둔다 — 공급자 쪽 모델 목록이 바뀌면
+# 코드 수정 없이 .env의 이 값만 바꾸면 된다. 실제 사용 가능한 모델명은
+# 발급받은 콘솔(Google AI Studio 등)에서 확인해 채운다.
+LLM_MODEL = os.environ.get("LLM_MODEL", "gemini-3.6-flash")
 
 
 def bizinfo_configured() -> bool:
