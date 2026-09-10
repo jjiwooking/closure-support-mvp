@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+closure_support.db
+streamlit.log
+.env
