@@ -262,28 +262,37 @@ def screen_dashboard():
 
 
 def _answer_stage_context(tasks, question_text):
-    """등록된 근거만 사용해 답변을 만들고 대화 형식으로 표시할 텍스트를 반환한다."""
+    """등록된 근거만 사용해 답변을 만들고 대화 형식으로 표시할 텍스트를 반환한다.
+    source_type에 따라 검증된 등록 자료 답변과 미검토 실시간 검색 답변을
+    화면에서 구조적으로 구분해 보여준다."""
     response = build_stage_response(conn, tasks, question_text)
     text = response["answer"]
+    source_type = response.get("source_type", "none")
 
-    if response["source_ids"]:
-        source = conn.execute(
-            "SELECT * FROM sources WHERE id=?", (response["source_ids"][0],)
-        ).fetchone()
-        if source:
-            text += (
-                f"\n\n*출처: {source['agency']} · {source['title']} · "
-                f"확인일: {source['reviewed_at'] or '확인 필요'}*"
+    if source_type == "local":
+        if response["source_ids"]:
+            source = conn.execute(
+                "SELECT * FROM sources WHERE id=?", (response["source_ids"][0],)
+            ).fetchone()
+            if source:
+                text += (
+                    f"\n\n*출처: {source['agency']} · {source['title']} · "
+                    f"확인일: {source['reviewed_at'] or '확인 필요'}*"
+                )
+        if response["actions"]:
+            links = "\n".join(
+                f"- [관련 공식 링크 열기](https://example-official-site.invalid/{a['link_id']})"
+                for a in response["actions"]
             )
-    else:
-        text += "\n\n*검토된 공식 자료가 없어 지어내지 않고 확인 필요로 표시했습니다.*"
-
-    if response["actions"]:
-        links = "\n".join(
-            f"- [관련 공식 링크 열기](https://example-official-site.invalid/{a['link_id']})"
-            for a in response["actions"]
+            text += "\n\n" + links
+    elif source_type == "web_search":
+        text = (
+            "**[미검토 · 실시간 검색 결과]**\n\n"
+            f"{text}\n\n"
+            "*이 답변은 사람이 검토한 등록 자료가 아니라 실시간 검색 결과입니다. "
+            "반드시 공식 사이트에서 직접 확인하세요.*"
         )
-        text += "\n\n" + links
+    # source_type == "none"이면 response["answer"] 자체가 이미 확인 필요 안내다.
 
     return text
 
