@@ -8,10 +8,15 @@ LLM에 건네 질문과 관련된 부분 위주로 답하게 한다.
 LLM_API_KEY가 없거나 호출이 실패하면 모아둔 근거를 그대로 보여줘 답변이
 항상 가능하게 한다(API 장애에도 기본 안내는 계속 제공되어야 한다는 검수
 기준을 만족).
+
+등록된 근거가 전혀 없는 경우에는 구글 검색 그라운딩으로 보조 답변을
+시도한다. 이 결과는 사람이 검토한 자료가 아니므로 반드시 "확인 필요" 및
+출처 링크와 함께 미검증 정보임을 밝힌다(팀플.md의 "미검토 자료의 중요
+조건을 확정 안내하지 않는다" 원칙).
 """
 
 from config import llm_configured
-from llm_client import generate_text
+from llm_client import generate_text, generate_text_with_search
 
 
 def _fallback_response():
@@ -20,6 +25,28 @@ def _fallback_response():
         "source_ids": [],
         "actions": [],
     }
+
+
+def _web_search_answer(question: str):
+    """등록된 근거가 없을 때만 쓰는 보조 수단. 검토되지 않은 실시간 검색
+    결과이므로 항상 미확인 표시와 출처 링크를 붙인다. 실패하면 None."""
+    system_instruction = (
+        "당신은 한국 소상공인의 폐업 절차를 돕는 검색 도우미입니다. "
+        "정부24, 국세청, 서울시, 기업마당 등 공식 정부/지자체 사이트 정보를 우선해서 찾으세요. "
+        "확실하지 않은 내용은 반드시 '확인 필요'라고 표시하세요. "
+        "2~4문장으로 간결하게 답하세요."
+    )
+    prompt = f"다음 질문에 대해 한국 공식 정부 사이트를 검색해서 답해주세요: {question}"
+    result = generate_text_with_search(prompt, system_instruction=system_instruction)
+    if not (result["ok"] and result["text"]):
+        return None
+
+    text = result["text"].strip()
+    text += "\n\n*(이 답변은 실시간 검색 결과이며 사람이 검토하지 않았습니다. 반드시 공식 사이트에서 직접 확인하세요.)*"
+    if result["citations"]:
+        links = "\n".join(f"- [{c['title']}]({c['uri']})" for c in result["citations"][:3])
+        text += "\n\n" + links
+    return text
 
 
 def validate_response(conn, response: dict) -> dict:
@@ -104,6 +131,10 @@ def build_stage_response(conn, tasks: list, question: str) -> dict:
                 actions.append({"type": "open_official_link", "link_id": d["submission_link_id"]})
 
     if not blocks:
+        if llm_configured():
+            search_text = _web_search_answer(question)
+            if search_text:
+                return {"answer": search_text, "source_ids": [], "actions": []}
         return _fallback_response()
 
     grounding_context = "\n\n".join(blocks)
