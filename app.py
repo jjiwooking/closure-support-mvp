@@ -2,7 +2,7 @@ from datetime import date
 
 import streamlit as st
 
-from coaching import build_response, classify_intent
+from coaching import build_stage_response
 from db import get_connection, init_db
 from seed import seed_if_empty
 from services import (
@@ -261,25 +261,10 @@ def screen_dashboard():
     render_stage_checklist(all_tasks)
 
 
-INTENT_LABELS = {
-    "정책_설명": "지원정책 안내",
-    "서류_발급_경로": "서류 안내",
-    "작성_코칭": "작성 안내",
-    "다음_할일": "다음 할 일 안내",
-    "완료_기록": "완료 기록 안내",
-    "보완_요청_설명": "보완 요청 안내",
-    "일정_변경": "일정 변경 안내",
-    "판매_글_생성": "판매 글 안내",
-    "상황_등록": "상황 등록 안내",
-    "unknown": "확인 필요",
-}
-
-
-def _answer_with_context(task, intent, question_text):
+def _answer_stage_context(tasks, question_text):
     """등록된 근거만 사용해 답변을 만들고 대화 형식으로 표시할 텍스트를 반환한다."""
-    response = build_response(conn, intent, task, question_text)
-    label = INTENT_LABELS.get(intent, "코칭 안내")
-    text = f"**[{label}]**\n\n{response['answer']}"
+    response = build_stage_response(conn, tasks, question_text)
+    text = response["answer"]
 
     if response["source_ids"]:
         source = conn.execute(
@@ -303,41 +288,22 @@ def _answer_with_context(task, intent, question_text):
     return text
 
 
-def render_stage_chat(stage_key, stage_label, task):
-    """단계 하나당 챗봇 하나. 대화 기록은 단계 단위로 이어지며, 그 안에서 어떤
-    업무를 고르든(위 선택박스) 같은 대화창에 계속 쌓인다. 규칙 기반 파이프라인
-    (coaching.py)을 사용하며 실제 LLM은 아직 연결되어 있지 않다."""
+def render_stage_chat(stage_key, stage_label, tasks):
+    """단계 하나당 챗봇 하나. 업무를 먼저 고를 필요 없이 이 단계에 속한 모든
+    업무의 근거를 한꺼번에 참고해서 답한다."""
     history_key = f"chat_stage_{stage_key}"
     if history_key not in st.session_state:
         st.session_state[history_key] = []
 
-    def ask(intent, question_text):
-        st.session_state[history_key].append(("user", question_text, task["task_title"]))
-        answer = _answer_with_context(task, intent, question_text)
-        st.session_state[history_key].append(("assistant", answer, task["task_title"]))
-
-    quick_prompts = [
-        ("쉽게 설명해줘", "다음_할일"),
-        ("어디서 해?", "서류_발급_경로"),
-        ("작성 도와줘", "작성_코칭"),
-        ("막혔어요", "보완_요청_설명"),
-    ]
-    cols = st.columns(len(quick_prompts))
-    for col, (label, intent) in zip(cols, quick_prompts):
-        with col:
-            if st.button(label, key=f"quick_{task['id']}_{intent}", use_container_width=True):
-                ask(intent, label)
-
-    for role, content, task_title in st.session_state[history_key]:
+    for role, content in st.session_state[history_key]:
         with st.chat_message(role):
-            if role == "user":
-                st.caption(f"({task_title})")
             st.markdown(content)
 
-    user_q = st.chat_input(f"{stage_label} 챗봇에게 물어보세요 (현재 선택: {task['task_title']})")
+    user_q = st.chat_input(f"{stage_label} 챗봇에게 물어보세요")
     if user_q:
-        intent = classify_intent(user_q)
-        ask(intent, user_q)
+        st.session_state[history_key].append(("user", user_q))
+        answer = _answer_stage_context(tasks, user_q)
+        st.session_state[history_key].append(("assistant", answer))
         st.rerun()
 
 
@@ -474,18 +440,14 @@ def screen_stage(stage_key, stage_label):
         st.write(f"- [{t['status']}] {t['task_title']} · 기한: {t.get('due_date') or '미정'}")
 
     st.divider()
-    options = {t["task_title"]: t for t in tasks}
-    selected_label = st.selectbox(
-        "코칭받을 업무 선택", list(options.keys()), key=f"select_{stage_key}"
-    )
-    task = options[selected_label]
-
     st.subheader(f"{stage_label} 챗봇")
-    render_stage_chat(stage_key, stage_label, task)
+    render_stage_chat(stage_key, stage_label, tasks)
 
     st.divider()
     st.subheader("업무 상세 정보")
-    render_task_core(task)
+    for t in tasks:
+        with st.expander(f"[{t['status']}] {t['task_title']}"):
+            render_task_core(t)
 
 
 def screen_policies():
