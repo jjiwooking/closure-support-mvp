@@ -233,6 +233,79 @@ def sync_bizinfo_policies(conn, keyword: str = "폐업") -> dict:
     }
 
 
+def log_research_run(conn, source_count: int):
+    """백그라운드 정책리서치 1회 실행 기록을 남긴다(설계문서 ERD의 research_runs)."""
+    conn.execute(
+        "INSERT INTO research_runs (run_at, source_count) VALUES (?, ?)",
+        (datetime.utcnow().isoformat(), source_count),
+    )
+    conn.commit()
+
+
+def find_new_policy_matches(conn, user_id, profile: dict):
+    """사람이 검토를 마친(review_status='검토완료') 정책 중, 이 사용자에게 아직
+    한 번도 매칭 알림을 보낸 적 없고, 조건(evaluate_eligibility)과 진로가 맞는
+    것만 추린다. DB에 쓰지는 않는 순수 판정 함수."""
+    rows = conn.execute(
+        """
+        SELECT p.* FROM policies p
+        JOIN sources s ON p.source_id = s.id
+        WHERE s.review_status = '검토완료'
+        """
+    ).fetchall()
+    policies = [dict(r) for r in rows]
+
+    already_matched = {
+        row["policy_id"]
+        for row in conn.execute(
+            "SELECT policy_id FROM policy_matches WHERE user_id=?", (user_id,)
+        ).fetchall()
+    }
+    candidates = [p for p in policies if p["id"] not in already_matched]
+    candidates = filter_policies_by_career(candidates, profile.get("career_path"))
+
+    return [
+        p for p in candidates
+        if evaluate_eligibility(profile, p["eligibility_rules"]) == "입력 조건 부합"
+    ]
+
+
+def record_policy_match_and_notify(conn, user_id, policy: dict):
+    """정책 매칭 1건을 기록하고(policy_matches) 사용자에게 알림을 만든다(notifications)."""
+    now = datetime.utcnow().isoformat()
+    conn.execute(
+        """
+        INSERT INTO policy_matches (user_id, policy_id, match_reason, matched_at)
+        VALUES (?, ?, ?, ?)
+        """,
+        (user_id, policy["id"], "조건/진로 일치", now),
+    )
+    conn.execute(
+        """
+        INSERT INTO notifications (user_id, policy_id, message, sent_at, read_at)
+        VALUES (?, ?, ?, ?, NULL)
+        """,
+        (user_id, policy["id"], f"'{policy['title']}' 조건에 맞는 지원사업이 새로 등록됐어요.", now),
+    )
+    conn.commit()
+
+
+def get_unread_notifications(conn, user_id):
+    rows = conn.execute(
+        "SELECT * FROM notifications WHERE user_id=? AND read_at IS NULL ORDER BY sent_at DESC",
+        (user_id,),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def mark_notification_read(conn, notification_id):
+    conn.execute(
+        "UPDATE notifications SET read_at=? WHERE id=?",
+        (datetime.utcnow().isoformat(), notification_id),
+    )
+    conn.commit()
+
+
 # ---------- 규칙 엔진 (LLM 미사용, 순수 코드) ----------
 
 # 체크리스트 완료시 자동 이동할 다음 단계. 마지막 단계('후')는 다음이 없다.

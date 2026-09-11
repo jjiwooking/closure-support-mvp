@@ -125,6 +125,31 @@ CREATE TABLE IF NOT EXISTS policy_applications (
     updated_at TEXT,
     FOREIGN KEY(user_task_id) REFERENCES user_tasks(id)
 );
+
+CREATE TABLE IF NOT EXISTS research_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_at TEXT,
+    source_count INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS policy_matches (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT NOT NULL,
+    policy_id INTEGER NOT NULL,
+    match_reason TEXT,
+    matched_at TEXT,
+    FOREIGN KEY(policy_id) REFERENCES policies(id)
+);
+
+CREATE TABLE IF NOT EXISTS notifications (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT NOT NULL,
+    policy_id INTEGER,
+    message TEXT,
+    sent_at TEXT,
+    read_at TEXT,
+    FOREIGN KEY(policy_id) REFERENCES policies(id)
+);
 """
 
 

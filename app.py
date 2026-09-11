@@ -4,6 +4,7 @@ import streamlit as st
 
 from coaching import build_stage_response
 from db import get_connection, init_db
+from research_graph import run_research
 from seed import seed_if_empty
 from services import (
     NEXT_STAGE,
@@ -13,14 +14,15 @@ from services import (
     filter_policies_by_career,
     generate_listing,
     get_or_create_application,
+    get_unread_notifications,
     log_change,
+    mark_notification_read,
     priority_sort,
     record_application_date,
     record_supplement,
     register_policy_interest,
     should_suggest_trade,
     sort_policies_by_deadline,
-    sync_bizinfo_policies,
     toggle_document_check,
     update_application_payment,
     update_career_path,
@@ -272,8 +274,21 @@ def render_stage_transition_banner():
             st.rerun()
 
 
+def render_notifications():
+    """백그라운드 정책리서치가 찾아낸, 아직 읽지 않은 맞춤 알림을 보여준다."""
+    for n in get_unread_notifications(conn, USER_ID):
+        c1, c2 = st.columns([5, 1])
+        with c1:
+            st.info(n["message"])
+        with c2:
+            if st.button("읽음으로 표시", key=f"notif_read_{n['id']}"):
+                mark_notification_read(conn, n["id"])
+                st.rerun()
+
+
 def screen_dashboard():
     render_stage_transition_banner()
+    render_notifications()
     st.header("폐업 진행 상황")
     st.write(
         "폐업은 **폐업 준비 → 폐업 진행 → 폐업 후** 3단계로 진행돼요. "
@@ -503,25 +518,24 @@ def screen_stage(stage_key, stage_label):
 def screen_policies():
     st.header("지원정책")
 
+    profile = get_profile()
+
     with st.expander("기업마당 자료 동기화 (관리자용)", expanded=False):
         st.caption(
             "수집만 하고 자동 게시하지 않습니다. 담당자가 검토해 review_status를 "
-            "'검토완료'로 바꾸기 전까지는 아래 추천 목록에 나타나지 않습니다."
+            "'검토완료'로 바꾸기 전까지는 아래 추천 목록에 나타나지 않습니다. "
+            "이미 검토완료된 정책 중 조건에 맞는 게 있으면 대시보드에 알림이 생깁니다."
         )
-        if st.button("지금 동기화 시도"):
-            result = sync_bizinfo_policies(conn)
-            if not result["configured"]:
-                st.warning(result["message"])
-            elif result["message"] and "수집해" in result["message"]:
-                st.success(result["message"])
-            else:
-                st.error(result["message"] or "알 수 없는 오류입니다.")
+        if st.button("지금 리서치 실행"):
+            result = run_research(conn, USER_ID, profile)
+            st.success(
+                f"신규 수집 {result['source_count']}건, "
+                f"새로운 맞춤 알림 {result['new_matches']}건"
+            )
         pending = conn.execute(
             "SELECT COUNT(*) AS c FROM sources WHERE review_status != '검토완료'"
         ).fetchone()["c"]
         st.caption(f"검토 대기 중인 자료: {pending}건")
-
-    profile = get_profile()
 
     career_options = ["모름", "재창업", "취업"]
     current_career = profile.get("career_path") or "모름"
