@@ -25,6 +25,15 @@ _load_dotenv()
 # 기업마당 지원사업정보 API 서비스키 (crtfcKey)
 BIZINFO_API_KEY = os.environ.get("BIZINFO_API_KEY")
 
+# 공공데이터포털(data.go.kr) 지원정책 API 서비스키. 실제 엔드포인트는
+# datago_client.py에 아직 채워지지 않았으니 키만 넣어서는 동작하지 않는다.
+DATA_GO_KR_API_KEY = os.environ.get("DATA_GO_KR_API_KEY")
+
+# 제품안전정보센터(safetykorea.kr) 인증정보 조회 API 서비스키. 사진 인식이 아니라
+# 모델명/인증번호 기반 조회용이며, 실제 엔드포인트는 safetykorea_client.py에
+# 아직 채워지지 않았다.
+SAFETYKOREA_API_KEY = os.environ.get("SAFETYKOREA_API_KEY")
+
 # LLM 공급자. 예: "anthropic", "gemini", "openai"
 LLM_PROVIDER = os.environ.get("LLM_PROVIDER")
 LLM_API_KEY = os.environ.get("LLM_API_KEY")
@@ -38,6 +47,14 @@ EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "gemini-embedding-001")
 
 def bizinfo_configured() -> bool:
     return bool(BIZINFO_API_KEY)
+
+
+def datago_configured() -> bool:
+    return bool(DATA_GO_KR_API_KEY)
+
+
+def safetykorea_configured() -> bool:
+    return bool(SAFETYKOREA_API_KEY)
 
 
 def llm_configured() -> bool:

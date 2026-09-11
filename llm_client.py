@@ -9,6 +9,7 @@ LLM 호출 뼈대. 현재는 Gemini REST API만 지원한다(LLM_PROVIDER="gemin
 API를 부르지 않고 바로 실패를 반환해 호출부가 조용히 폴백하게 한다(검수기준
 "API 장애에도 기본 안내 제공"과 같은 취지).
 """
+import base64
 import json
 import urllib.error
 import urllib.request
@@ -127,6 +128,39 @@ def generate_text_with_search(prompt: str, system_instruction: str = None) -> di
         return {"ok": False, "text": None, "citations": [], "error": "Gemini 응답 형식을 해석할 수 없습니다."}
 
     return {"ok": True, "text": text, "citations": _extract_citations(result["data"]), "error": None}
+
+
+def classify_product_image(image_bytes: bytes, mime_type: str, prompt: str = None) -> dict:
+    """중고 집기 사진을 보고 품목/브랜드/추정 상태를 설명하게 한다(설계문서의
+    '가게에서 쓰는 전자제품 사진 판독'에 해당). 새 API 키가 필요 없다 — 이미
+    쓰고 있는 Gemini LLM_API_KEY로 그대로 동작한다. 결과는 사람이 검토 없이
+    바로 믿을 정보가 아니므로, 호출부가 사용자에게 확인을 받도록 안내해야 한다.
+    반환 형식: {"ok": bool, "text": str | None, "error": str | None}"""
+    default_prompt = (
+        "이 사진 속 중고 매장 집기/전자제품을 설명해주세요. 품목명, 추정 브랜드나 "
+        "모델(확실하지 않으면 '확인 필요'), 눈에 보이는 상태나 하자를 2~3문장으로 "
+        "답하세요. 확실하지 않은 내용은 '확인 필요'라고 표시하세요."
+    )
+    body = {
+        "contents": [
+            {
+                "parts": [
+                    {"inlineData": {"mimeType": mime_type, "data": base64.b64encode(image_bytes).decode("ascii")}},
+                    {"text": prompt or default_prompt},
+                ]
+            }
+        ]
+    }
+
+    result = _call_gemini(body)
+    if not result["ok"]:
+        return {"ok": False, "text": None, "error": result["error"]}
+
+    text = _extract_text(result["data"])
+    if text is None:
+        return {"ok": False, "text": None, "error": "Gemini 응답 형식을 해석할 수 없습니다."}
+
+    return {"ok": True, "text": text, "error": None}
 
 
 def _extract_embedding(data: dict):
