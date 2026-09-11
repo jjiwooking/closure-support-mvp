@@ -13,6 +13,7 @@ CREATE TABLE IF NOT EXISTS profiles (
     employee_status TEXT,
     rent_status TEXT,
     demolition_status TEXT,
+    career_path TEXT,
     confirmed_at TEXT
 );
 
@@ -35,6 +36,8 @@ CREATE TABLE IF NOT EXISTS policies (
     eligibility_rules TEXT,
     application_link_id TEXT,
     availability_status TEXT,
+    target_career TEXT,
+    application_deadline TEXT,
     FOREIGN KEY(source_id) REFERENCES sources(id)
 );
 
@@ -144,4 +147,17 @@ def _migrate(conn):
     cols = [row["name"] for row in conn.execute("PRAGMA table_info(task_templates)")]
     if "offset_days" not in cols:
         conn.execute("ALTER TABLE task_templates ADD COLUMN offset_days INTEGER")
+        conn.commit()
+
+    profile_cols = [row["name"] for row in conn.execute("PRAGMA table_info(profiles)")]
+    if "career_path" not in profile_cols:
+        conn.execute("ALTER TABLE profiles ADD COLUMN career_path TEXT")
+        conn.commit()
+
+    policy_cols = [row["name"] for row in conn.execute("PRAGMA table_info(policies)")]
+    if "target_career" not in policy_cols:
+        conn.execute("ALTER TABLE policies ADD COLUMN target_career TEXT")
+        conn.commit()
+    if "application_deadline" not in policy_cols:
+        conn.execute("ALTER TABLE policies ADD COLUMN application_deadline TEXT")
         conn.commit()

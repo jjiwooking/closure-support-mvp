@@ -32,6 +32,8 @@ LLM_API_KEY = os.environ.get("LLM_API_KEY")
 # 코드 수정 없이 .env의 이 값만 바꾸면 된다. 실제 사용 가능한 모델명은
 # 발급받은 콘솔(Google AI Studio 등)에서 확인해 채운다.
 LLM_MODEL = os.environ.get("LLM_MODEL", "gemini-3.6-flash")
+# 가이드 RAG 검색에 쓰는 임베딩 모델. 생성용 LLM_MODEL과 별도로 관리한다.
+EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "gemini-embedding-001")
 
 
 def bizinfo_configured() -> bool:

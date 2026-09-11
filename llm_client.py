@@ -1,26 +1,48 @@
 """
 LLM 호출 뼈대. 현재는 Gemini REST API만 지원한다(LLM_PROVIDER="gemini").
 키가 없거나 호출이 실패하면 예외를 삼키지 않고 명확한 오류를 반환해서,
-호출부(coaching.py)가 규칙 기반 문구로 안전하게 폴백할 수 있게 한다.
+호출부(coaching.py, guide_graph.py, rag_store.py)가 규칙 기반 문구로 안전하게
+폴백할 수 있게 한다.
+
+할당량 보호: generate_text/generate_text_with_search/generate_embedding
+세 호출 모두 이 모듈의 프로세스당 호출 수 상한을 공유한다. 상한에 도달하면
+API를 부르지 않고 바로 실패를 반환해 호출부가 조용히 폴백하게 한다(검수기준
+"API 장애에도 기본 안내 제공"과 같은 취지).
 """
 import json
 import urllib.error
 import urllib.request
 
-from config import LLM_API_KEY, LLM_MODEL, LLM_PROVIDER, llm_configured
+from config import EMBEDDING_MODEL, LLM_API_KEY, LLM_MODEL, LLM_PROVIDER, llm_configured
 
 GEMINI_ENDPOINT_TMPL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+GEMINI_EMBED_ENDPOINT_TMPL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:embedContent"
+
+MAX_LLM_CALLS_PER_PROCESS = 30
+
+_llm_call_count = 0
 
 
-def _call_gemini(body: dict) -> dict:
-    """공통 호출부. 반환 형식: {"ok": bool, "data": dict | None, "error": str | None}"""
+def _quota_available() -> bool:
+    return _llm_call_count < MAX_LLM_CALLS_PER_PROCESS
+
+
+def _record_call():
+    global _llm_call_count
+    _llm_call_count += 1
+
+
+def _post_gemini(url: str, body: dict) -> dict:
+    """공통 POST 호출부. 반환 형식: {"ok": bool, "data": dict | None, "error": str | None}"""
     if not llm_configured():
         return {"ok": False, "data": None, "error": "LLM_PROVIDER/LLM_API_KEY가 설정되지 않았습니다."}
 
     if LLM_PROVIDER != "gemini":
         return {"ok": False, "data": None, "error": f"미지원 LLM_PROVIDER: {LLM_PROVIDER} (현재 gemini만 지원)"}
 
-    url = GEMINI_ENDPOINT_TMPL.format(model=LLM_MODEL)
+    if not _quota_available():
+        return {"ok": False, "data": None, "error": "프로세스당 LLM 호출 상한에 도달했습니다."}
+
     req = urllib.request.Request(
         url,
         data=json.dumps(body).encode("utf-8"),
@@ -32,11 +54,17 @@ def _call_gemini(body: dict) -> dict:
             data = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", "ignore")[:300]
+        _record_call()
         return {"ok": False, "data": None, "error": f"Gemini API 오류({exc.code}): {detail}"}
     except urllib.error.URLError as exc:
         return {"ok": False, "data": None, "error": f"Gemini API 연결 실패: {exc}"}
 
+    _record_call()
     return {"ok": True, "data": data, "error": None}
+
+
+def _call_gemini(body: dict) -> dict:
+    return _post_gemini(GEMINI_ENDPOINT_TMPL.format(model=LLM_MODEL), body)
 
 
 def _extract_text(data: dict):
@@ -99,3 +127,27 @@ def generate_text_with_search(prompt: str, system_instruction: str = None) -> di
         return {"ok": False, "text": None, "citations": [], "error": "Gemini 응답 형식을 해석할 수 없습니다."}
 
     return {"ok": True, "text": text, "citations": _extract_citations(result["data"]), "error": None}
+
+
+def _extract_embedding(data: dict):
+    try:
+        return data["embedding"]["values"]
+    except (KeyError, TypeError):
+        return None
+
+
+def generate_embedding(text: str) -> dict:
+    """가이드 RAG 검색용 임베딩 벡터를 생성한다.
+    반환 형식: {"ok": bool, "values": list[float] | None, "error": str | None}"""
+    url = GEMINI_EMBED_ENDPOINT_TMPL.format(model=EMBEDDING_MODEL)
+    body = {"content": {"parts": [{"text": text}]}}
+
+    result = _post_gemini(url, body)
+    if not result["ok"]:
+        return {"ok": False, "values": None, "error": result["error"]}
+
+    values = _extract_embedding(result["data"])
+    if values is None:
+        return {"ok": False, "values": None, "error": "Gemini 임베딩 응답 형식을 해석할 수 없습니다."}
+
+    return {"ok": True, "values": values, "error": None}

@@ -12,8 +12,8 @@ def seed_if_empty(conn, user_id):
     conn.execute(
         """
         INSERT INTO profiles
-            (user_id, region, planned_close_date, reported_closed, employee_status, rent_status, demolition_status, confirmed_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            (user_id, region, planned_close_date, reported_closed, employee_status, rent_status, demolition_status, career_path, confirmed_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             user_id,
@@ -23,6 +23,7 @@ def seed_if_empty(conn, user_id):
             "있음",
             "임차",
             "미정",
+            "모름",
             date.today().isoformat(),
         ),
     )
@@ -46,8 +47,9 @@ def seed_if_empty(conn, user_id):
 
     cur = conn.execute(
         """
-        INSERT INTO policies (source_id, title, period, eligibility_rules, application_link_id, availability_status)
-        VALUES (?, ?, ?, ?, ?, ?)
+        INSERT INTO policies
+            (source_id, title, period, eligibility_rules, application_link_id, availability_status, target_career, application_deadline)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             source_id,
@@ -56,9 +58,30 @@ def seed_if_empty(conn, user_id):
             json.dumps({"region": "서울 마포구", "rent_status": "임차"}, ensure_ascii=False),
             "policy_apply_1",
             "모집중",
+            "공통",
+            None,
         ),
     )
     policy_id = cur.lastrowid
+
+    # 진로별 필터링/마감일 정렬이 실제로 눈에 보이도록 재창업 전용 예시 정책을 하나 더 둔다.
+    conn.execute(
+        """
+        INSERT INTO policies
+            (source_id, title, period, eligibility_rules, application_link_id, availability_status, target_career, application_deadline)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            source_id,
+            "재창업 지원금(시연용 예시)",
+            (date.today() + timedelta(days=20)).isoformat() + "까지",
+            json.dumps({"region": "서울 마포구"}, ensure_ascii=False),
+            "policy_apply_2",
+            "모집중",
+            "재창업",
+            (date.today() + timedelta(days=20)).isoformat(),
+        ),
+    )
 
     # offset_days: 폐업 예정일로부터 며칠 전이 기한인지. due_type이 '사용자 예정일'인
     # 업무에만 의미가 있으며, 폐업일이 바뀌면 이 값을 기준으로 기한을 재계산한다.

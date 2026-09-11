@@ -96,6 +96,19 @@ def recalculate_user_dates(conn, user_id, new_planned_close_date):
     conn.commit()
 
 
+def update_career_path(conn, user_id, career_path):
+    """기능2(정책 매칭)에서 고른 진로(재창업/취업/모름)를 프로필에 지속 저장한다."""
+    row = conn.execute("SELECT * FROM profiles WHERE user_id=?", (user_id,)).fetchone()
+    profile = dict(row)
+    if profile.get("career_path") == career_path:
+        return
+    conn.execute(
+        "UPDATE profiles SET career_path=? WHERE user_id=?", (career_path, user_id)
+    )
+    conn.commit()
+    log_change(conn, user_id, "profile", profile["id"], profile.get("career_path"), career_path)
+
+
 # ---------- 정책 흐름: 신청 기록 / 보완 / 심사·입금 (준비 완료와 구분되는 별도 기록) ----------
 
 def get_or_create_application(conn, user_task_id):
@@ -222,11 +235,30 @@ def sync_bizinfo_policies(conn, keyword: str = "폐업") -> dict:
 
 # ---------- 규칙 엔진 (LLM 미사용, 순수 코드) ----------
 
+# 체크리스트 완료시 자동 이동할 다음 단계. 마지막 단계('후')는 다음이 없다.
+NEXT_STAGE = {"준비": "진행", "진행": "후", "후": None}
+
+
 def compute_progress(tasks):
     """적용 확정 업무 중 사용자 완료 수 / 적용 확정 업무 수. 분모가 0이면 (0, 0)을 반환."""
     total = len(tasks)
     completed = sum(1 for t in tasks if t["status"] == "사용자 완료")
     return completed, total
+
+
+def check_stage_complete(stage_tasks) -> bool:
+    """해당 단계에 업무가 하나 이상 있고 전부 '사용자 완료'인지 확인한다."""
+    completed, total = compute_progress(stage_tasks)
+    return total > 0 and completed == total
+
+
+def should_suggest_trade(conn, user_id) -> bool:
+    """아직 처분하지 않은 집기가 있으면 중고거래 메뉴 이동을 제안할 만하다고 본다."""
+    row = conn.execute(
+        "SELECT COUNT(*) AS c FROM equipment WHERE user_id=? AND status != '처분 완료'",
+        (user_id,),
+    ).fetchone()
+    return row["c"] > 0
 
 
 def priority_sort(tasks):
@@ -240,6 +272,26 @@ def priority_sort(tasks):
         return (is_overdue, has_due, due or "9999-99-99")
 
     return sorted(tasks, key=sort_key)
+
+
+def filter_policies_by_career(policies, career_path):
+    """진로를 아직 안 골랐으면('모름'/None) 전체를 보여준다. 골랐으면 그 진로 전용이거나
+    '공통'이거나 아직 태그가 안 된(NULL) 정책만 남긴다(미태그 정책을 실수로 숨기지 않기 위함)."""
+    if not career_path or career_path == "모름":
+        return list(policies)
+    return [
+        p for p in policies
+        if p.get("target_career") in (career_path, "공통", None)
+    ]
+
+
+def sort_policies_by_deadline(policies):
+    """마감일 임박 순으로 정렬한다. 마감일이 없는(상시 등) 정책은 맨 뒤로 보낸다."""
+    def sort_key(p):
+        deadline = p.get("application_deadline")
+        return deadline or "9999-99-99"
+
+    return sorted(policies, key=sort_key)
 
 
 def evaluate_eligibility(profile: dict, eligibility_rules_json: str) -> str:

@@ -6,8 +6,11 @@ from coaching import build_stage_response
 from db import get_connection, init_db
 from seed import seed_if_empty
 from services import (
+    NEXT_STAGE,
+    check_stage_complete,
     compute_progress,
     evaluate_eligibility,
+    filter_policies_by_career,
     generate_listing,
     get_or_create_application,
     log_change,
@@ -15,9 +18,12 @@ from services import (
     record_application_date,
     record_supplement,
     register_policy_interest,
+    should_suggest_trade,
+    sort_policies_by_deadline,
     sync_bizinfo_policies,
     toggle_document_check,
     update_application_payment,
+    update_career_path,
     update_decision_status,
     update_profile,
     update_task_status,
@@ -227,13 +233,47 @@ def render_stage_checklist(all_tasks):
                     else:
                         st.caption(f"기한: {t.get('due_date') or '미정'}")
                 if new_checked != checked:
-                    update_task_status(
-                        conn, t["id"], "사용자 완료" if new_checked else "진행 중", USER_ID
-                    )
+                    new_status = "사용자 완료" if new_checked else "진행 중"
+                    update_task_status(conn, t["id"], new_status, USER_ID)
+                    if new_status == "사용자 완료":
+                        updated_stage_tasks = [
+                            {**x, "status": new_status} if x["id"] == t["id"] else x
+                            for x in stage_tasks
+                        ]
+                        if check_stage_complete(updated_stage_tasks):
+                            next_stage = NEXT_STAGE.get(stage_key)
+                            st.session_state["stage_transition"] = {
+                                "from": stage_key, "to": next_stage
+                            }
+                            if next_stage:
+                                st.session_state["current_page"] = STAGE_LABELS[next_stage]
                     st.rerun()
 
 
+def render_stage_transition_banner():
+    """체크리스트 완료로 자동 단계전환이 막 일어났다면 한 번만 배너로 알린다.
+    '준비' 단계를 막 끝냈고 아직 처분 안 된 집기가 있으면 중고거래 이동도 제안한다."""
+    transition = st.session_state.pop("stage_transition", None)
+    if not transition:
+        return
+
+    from_key, to_key = transition["from"], transition["to"]
+    if to_key:
+        st.success(
+            f"'{STAGE_LABELS[from_key]}' 단계를 모두 완료했어요! '{STAGE_LABELS[to_key]}' 단계로 이동했습니다."
+        )
+    else:
+        st.success(f"'{STAGE_LABELS[from_key]}' 단계를 모두 완료했어요! 모든 단계를 마쳤습니다.")
+
+    if from_key == "준비" and should_suggest_trade(conn, USER_ID):
+        st.info("정리할 집기가 있다면 지금 중고거래를 준비해보세요.")
+        if st.button("중고품 관리로 이동", key="goto_equipment_from_banner"):
+            st.session_state["current_page"] = "중고품 관리"
+            st.rerun()
+
+
 def screen_dashboard():
+    render_stage_transition_banner()
     st.header("폐업 진행 상황")
     st.write(
         "폐업은 **폐업 준비 → 폐업 진행 → 폐업 후** 3단계로 진행돼요. "
@@ -265,7 +305,7 @@ def _answer_stage_context(tasks, question_text):
     """등록된 근거만 사용해 답변을 만들고 대화 형식으로 표시할 텍스트를 반환한다.
     source_type에 따라 검증된 등록 자료 답변과 미검토 실시간 검색 답변을
     화면에서 구조적으로 구분해 보여준다."""
-    response = build_stage_response(conn, tasks, question_text)
+    response = build_stage_response(conn, tasks, question_text, USER_ID)
     text = response["answer"]
     source_type = response.get("source_type", "none")
 
@@ -438,6 +478,7 @@ def render_task_core(task):
 
 
 def screen_stage(stage_key, stage_label):
+    render_stage_transition_banner()
     st.header(stage_label)
     tasks = get_tasks(stage=stage_key)
     if not tasks:
@@ -481,6 +522,18 @@ def screen_policies():
         st.caption(f"검토 대기 중인 자료: {pending}건")
 
     profile = get_profile()
+
+    career_options = ["모름", "재창업", "취업"]
+    current_career = profile.get("career_path") or "모름"
+    new_career = st.selectbox(
+        "진로 (재창업 또는 취업을 고르면 관련 정책만 골라 보여드려요)",
+        career_options,
+        index=career_options.index(current_career) if current_career in career_options else 0,
+    )
+    if new_career != current_career:
+        update_career_path(conn, USER_ID, new_career)
+        st.rerun()
+
     rows = conn.execute(
         """
         SELECT p.*, s.agency, s.title AS source_title, s.url AS source_url, s.reviewed_at
@@ -489,17 +542,19 @@ def screen_policies():
         WHERE s.review_status = '검토완료'
         """
     ).fetchall()
+    rows = [dict(r) for r in rows]
+    rows = sort_policies_by_deadline(filter_policies_by_career(rows, current_career))
 
     if not rows:
-        st.info("등록된 지원사업이 없습니다.")
+        st.info("현재 진로 기준으로 등록된 지원사업이 없습니다.")
         return
 
     for r in rows:
-        r = dict(r)
         label = evaluate_eligibility(profile, r["eligibility_rules"])
         with st.container(border=True):
             st.subheader(r["title"])
             st.write(f"기관: {r['agency']} · 신청기간: {r.get('period') or '확인 필요'}")
+            st.write(f"마감일: {r.get('application_deadline') or '상시/미정'}")
             st.write(f"공식 공고: {r['source_url']}")
             badge_color = {
                 "입력 조건 부합": "green",
