@@ -110,7 +110,7 @@ def _run_guide(state: SupervisorState) -> dict:
     response = build_stage_response(state["conn"], state["tasks"], state["question"], state["user_id"])
     return {
         "answer": response["answer"],
-        "agent_name": "🧭 가이드 에이전트",
+        "agent_name": "가이드 에이전트",
         "source_type": response.get("source_type", "none"),
         "source_ids": response.get("source_ids", []),
         "actions": response.get("actions", []),
@@ -130,10 +130,14 @@ def _llm_policy_answer(question: str, grounding: str):
     return None
 
 
+POLICY_REFERENCE_WORDS = ["그 정책", "그 사업", "이 정책", "저 정책", "그거", "거기"]
+
+
 def _run_policy(state: SupervisorState) -> dict:
     conn = state["conn"]
     profile = state["profile"]
-    agent_name = "📋 정책상담 에이전트"
+    agent_name = "정책상담 에이전트"
+    question = state["question"]
 
     policies = services.get_reviewed_policies(conn)
     policies = filter_policies_by_career(policies, profile.get("career_path"))
@@ -144,7 +148,17 @@ def _run_policy(state: SupervisorState) -> dict:
         score = analytics.score_policy_fit(profile, p["eligibility_rules"])
         scored.append((score, label, p))
     scored.sort(key=lambda x: -x[0])
-    top = scored[:3]
+
+    # '그 정책' 같은 지시어가 있고 직전에 다루던 정책(focus)이 있으면, 후보
+    # 상위 3건을 다시 나열하는 대신 그 정책 하나로 좁혀서 구체적으로 답한다.
+    focus_policy_title = (state.get("focus") or {}).get("policy_title")
+    top = None
+    if focus_policy_title and any(k in question for k in POLICY_REFERENCE_WORDS):
+        focused = next((s for s in scored if s[2]["title"] == focus_policy_title), None)
+        if focused:
+            top = [focused]
+    if top is None:
+        top = scored[:3]
 
     if not top:
         return {
@@ -157,7 +171,7 @@ def _run_policy(state: SupervisorState) -> dict:
         for score, label, p in top
     )
 
-    answer = _llm_policy_answer(state["question"], grounding) if llm_configured() else None
+    answer = _llm_policy_answer(question, grounding) if llm_configured() else None
     if not answer:
         lines = ["관련도 높은 지원사업을 찾았어요:"] + [
             f"· {p['title']} — 적합도 {score}/100({label})" for score, label, p in top
@@ -165,7 +179,10 @@ def _run_policy(state: SupervisorState) -> dict:
         answer = "\n".join(lines)
 
     answer += "\n\n*'지원정책' 화면에서 상세 조건을 확인하고 관심 사업으로 등록할 수 있어요.*"
-    return {"answer": answer, "agent_name": agent_name, "source_type": "local", "source_ids": [], "actions": []}
+    return {
+        "answer": answer, "agent_name": agent_name, "source_type": "local", "source_ids": [], "actions": [],
+        "_focus_policy_title": top[0][2]["title"],
+    }
 
 
 def _run_trade_price(conn, item: dict, agent_name: str) -> dict:
@@ -236,7 +253,7 @@ def _match_equipment(items: list, question: str, focus_equipment_id=None) -> lis
 def _run_trade(state: SupervisorState) -> dict:
     conn = state["conn"]
     question = state["question"]
-    agent_name = "💰 거래상담 에이전트"
+    agent_name = "거래상담 에이전트"
     focus_equipment_id = (state.get("focus") or {}).get("equipment_id")
 
     items = services.get_user_equipment(conn, state["user_id"])
@@ -265,12 +282,17 @@ _RUNNERS = {"guide": _run_guide, "policy": _run_policy, "trade": _run_trade}
 # ---------- 그래프 노드 ----------
 
 def _collect_focus(results: list) -> dict:
-    """_run_trade가 물품을 확실히 특정했을 때만 focus를 갱신한다(_focus_equipment_id
-    키 존재 여부로 판단). 특정 실패(되묻기) 시에는 이전 focus를 그대로 둔다."""
+    """_run_trade/_run_policy가 대상을 확실히 특정했을 때만(_focus_equipment_id/
+    _focus_policy_title 키 존재 여부로 판단) 해당 focus 키를 갱신 대상으로
+    담는다. 특정 실패(되묻기, 일반 top-3 나열) 시에는 그 키를 담지 않아
+    이전 값이 유지되게 한다."""
+    focus = {}
     for r in results:
         if "_focus_equipment_id" in r:
-            return {"equipment_id": r["_focus_equipment_id"]}
-    return {}
+            focus["equipment_id"] = r["_focus_equipment_id"]
+        if "_focus_policy_title" in r:
+            focus["policy_title"] = r["_focus_policy_title"]
+    return focus
 
 
 def dispatch(state: SupervisorState) -> dict:
@@ -280,9 +302,13 @@ def dispatch(state: SupervisorState) -> dict:
     구현했었다."""
     results = [_RUNNERS[route](state) for route in state["routes"]]
     update = {"agent_results": results}
-    focus = _collect_focus(results)
-    if focus:
-        update["focus"] = focus
+    new_focus = _collect_focus(results)
+    if new_focus:
+        # 이번 턴에 안 다룬 focus 키(예: 물품 얘기만 했을 때의 정책 focus)는
+        # 덮어쓰지 않고 이전 값을 그대로 이어간다.
+        merged_focus = dict(state.get("focus") or {})
+        merged_focus.update(new_focus)
+        update["focus"] = merged_focus
     return update
 
 

@@ -504,11 +504,30 @@ def get_marketplace_listings(conn, category: str = None, region: str = None):
 
 
 def record_marketplace_interest(conn, buyer_user_id, equipment_id):
+    """같은 구매자가 같은 물품에 여러 번 눌러도 한 건으로만 기록한다(중복 클릭이
+    판매자에게 보이는 관심 인원수를 부풀리지 않도록)."""
+    existing = conn.execute(
+        "SELECT id FROM marketplace_interests WHERE buyer_user_id=? AND equipment_id=?",
+        (buyer_user_id, equipment_id),
+    ).fetchone()
+    if existing:
+        return
     conn.execute(
         "INSERT INTO marketplace_interests (buyer_user_id, equipment_id, created_at) VALUES (?, ?, ?)",
         (buyer_user_id, equipment_id, datetime.utcnow().isoformat()),
     )
     conn.commit()
+
+
+def get_equipment_interests(conn, equipment_id):
+    """판매자가 '중고품 관리' 화면에서 자기 물품에 관심 표시한 사람을 볼 수 있게
+    한다 — 지금까지는 marketplace_interests에 기록만 되고 아무 화면에도 노출되지
+    않는 반쪽짜리 기능이었다."""
+    rows = conn.execute(
+        "SELECT buyer_user_id, created_at FROM marketplace_interests WHERE equipment_id=? ORDER BY created_at",
+        (equipment_id,),
+    ).fetchall()
+    return [dict(r) for r in rows]
 
 
 # ---------- 집기 판매 글 생성 (입력된 사실만 사용, 미입력 항목은 "확인 필요"로 표기) ----------

@@ -5,6 +5,7 @@ import streamlit as st
 
 from analytics import BUSINESS_TYPE_CATEGORIES, policy_approval_stats, score_equipment_match, score_policy_fit
 from db import get_connection, init_db
+from llm_client import classify_product_image, set_quota_backend
 from pricing_model import fetch_samples, parse_price, predict_price
 from research_graph import run_research
 from seed import seed_if_empty
@@ -16,6 +17,7 @@ from services import (
     evaluate_eligibility,
     filter_policies_by_career,
     generate_listing,
+    get_equipment_interests,
     get_marketplace_listings,
     get_or_create_application,
     get_unread_notifications,
@@ -47,21 +49,30 @@ st.set_page_config(page_title="다음걸음", layout="wide")
 st.markdown(
     """
     <style>
-    /* 버튼 터치 영역 확대 (접근성: 충분한 버튼 크기) */
+    /* 한글 가독성이 좋은 웹폰트(Pretendard) 적용 — 시스템 기본 폰트가 한글에서
+    깨지거나 어색하게 보이는 문제 방지 */
+    @import url("https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/static/pretendard.css");
+
+    html, body, [class*="css"] {
+        font-family: "Pretendard", -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+    }
+
+    /* 버튼 터치 영역 확대 (접근성: 충분한 버튼 크기). 반경은 과하게 둥글리지
+    않고 각을 살짝만 죽이는 정도로 절제 */
     div.stButton > button, a[data-testid="stBaseButton-secondary"],
     div[data-testid="stFormSubmitButton"] > button {
         padding: 0.55rem 1.1rem;
         font-size: 1.02rem;
-        border-radius: 10px;
+        border-radius: 6px;
     }
     /* 카드형 컨테이너를 더 뚜렷하게 */
     div[data-testid="stVerticalBlockBorderWrapper"] {
-        border-radius: 14px;
+        border-radius: 8px;
     }
     /* 채팅 말풍선 여백 확대 */
     div[data-testid="stChatMessage"] {
         padding: 0.6rem 0.9rem;
-        border-radius: 14px;
+        border-radius: 8px;
     }
     /* 채팅 입력창을 화면 하단에 고정 — 페이지가 길어져도 스크롤 없이 항상 보이게 */
     div[data-testid="stChatInput"] {
@@ -69,8 +80,8 @@ st.markdown(
         bottom: 0;
         z-index: 999;
         background-color: #FFFFFF;
-        border: 2px solid #0F766E;
-        border-radius: 12px;
+        border: 2px solid #15803D;
+        border-radius: 8px;
         padding: 0.4rem 0.6rem;
         margin-top: 0.5rem;
         box-shadow: 0 -2px 10px rgba(0, 0, 0, 0.08);
@@ -117,6 +128,19 @@ def _get_app_connection():
 
 
 conn = _get_app_connection()
+
+
+def _get_session_llm_count() -> int:
+    return st.session_state.get("_llm_call_count", 0)
+
+
+def _increment_session_llm_count() -> None:
+    st.session_state["_llm_call_count"] = st.session_state.get("_llm_call_count", 0) + 1
+
+
+# llm_client.py는 이 앱이 Streamlit이라는 걸 몰라야 하므로(나중에 다른 프레임워크로
+# 바꿀 때 로직 계층을 그대로 재사용하기 위함), 세션별 카운터를 여기서 주입한다.
+set_quota_backend(_get_session_llm_count, _increment_session_llm_count)
 
 
 def _login_screen():
@@ -354,13 +378,13 @@ def screen_dashboard():
         "폐업은 **폐업 준비 → 폐업 진행 → 폐업 후** 3단계로 진행돼요. "
         "아래 체크리스트에서 바로 완료 처리하거나, 왼쪽 '단계별 코칭' 메뉴에서 AI 코칭을 받을 수 있습니다."
     )
-    with st.expander("🤖 AI 에이전트 구조 보기", expanded=False):
+    with st.expander("AI 에이전트 구조 보기", expanded=False):
         st.markdown(
             "**단계별 코칭 챗봇** 질문 하나에도 여러 에이전트가 역할을 나눠 협업합니다.\n\n"
-            "- 🔀 **라우팅 에이전트**: 질문을 아래 세 전문 에이전트 중 하나로 연결\n"
-            "- 🧭 **가이드 에이전트**: 절차·서류 안내 (RAG 검색 + LLM)\n"
-            "- 📋 **정책상담 에이전트**: 적합도 점수 기반 지원사업 추천 (스코어링 모델 + LLM)\n"
-            "- 💰 **거래상담 에이전트**: 등록 물품의 AI 추천가 안내 (KNN 회귀 모델)\n\n"
+            "- **라우팅 에이전트**: 질문을 아래 세 전문 에이전트 중 하나로 연결\n"
+            "- **가이드 에이전트**: 절차·서류 안내 (RAG 검색 + LLM)\n"
+            "- **정책상담 에이전트**: 적합도 점수 기반 지원사업 추천 (스코어링 모델 + LLM)\n"
+            "- **거래상담 에이전트**: 등록 물품의 AI 추천가 안내 (KNN 회귀 모델)\n\n"
             "백그라운드/화면별로는 이런 에이전트들도 따로 동작해요.\n"
             "- **정책수집 → 정책구조화 → 매칭** ('지원정책' 화면 관리자용 리서치 버튼)\n"
             "- **가격추정 → 글초안 → 채널안내** (중고품 등록 후 '판매 글 생성')"
@@ -610,7 +634,7 @@ def screen_policies():
         if st.button("지금 리서치 실행"):
             result = run_research(conn, current_user_id(), profile)
             st.success(
-                f"🤖 정책수집 에이전트: {result['source_count']}건 수집 → "
+                f"정책수집 에이전트: {result['source_count']}건 수집 → "
                 f"정책구조화 에이전트: {result['extracted_count']}건 AI 초안 작성 → "
                 f"매칭 에이전트: {result['new_matches']}건 새 알림"
             )
@@ -683,7 +707,7 @@ def screen_policies():
     approval = policy_approval_stats(conn, current_career)
     if approval["decided"]:
         st.caption(
-            f"📊 유사 지원사업 과거 승인율: {approval['rate'] * 100:.0f}% "
+            f"유사 지원사업 과거 승인율: {approval['rate'] * 100:.0f}% "
             f"(과거 심사결과 {approval['decided']}건 기준)"
         )
 
@@ -724,7 +748,7 @@ def screen_policies():
                 "모집 상태 확인 필요": "gray",
             }.get(label, "gray")
             st.markdown(f":{badge_color}[● {label}]")
-            st.progress(fit_score / 100, text=f"🤖 AI 적합도 점수 {fit_score}/100")
+            st.progress(fit_score / 100, text=f"AI 적합도 점수 {fit_score}/100")
             st.caption(f"자료 검토일: {r.get('reviewed_at') or '확인 필요'}")
 
             if r["id"] in registered_policy_ids:
@@ -740,6 +764,24 @@ def screen_policies():
 
 def screen_equipment():
     st.header("중고품 관리")
+
+    with st.expander("사진으로 물품 인식 (선택, 등록 전 참고용)", expanded=False):
+        st.caption(
+            "사진을 올리고 분석하면 품목·브랜드·상태를 AI가 추정해 알려드려요. "
+            "확정된 정보가 아니니 실제 값은 직접 확인한 뒤 아래 '새 물품 등록' 폼에 입력하세요."
+        )
+        photo = st.file_uploader("물품 사진", type=["jpg", "jpeg", "png"], key="equipment_photo")
+        if photo and st.button("AI로 분석하기", key="analyze_equipment_photo"):
+            result = classify_product_image(photo.getvalue(), photo.type or "image/jpeg")
+            if result["ok"]:
+                st.session_state["equipment_photo_analysis"] = result["text"]
+            else:
+                st.warning(f"사진 분석에 실패했습니다: {result['error']}")
+        if st.session_state.get("equipment_photo_analysis"):
+            st.info(
+                f"AI 추정: {st.session_state['equipment_photo_analysis']}\n\n"
+                "*참고용 설명이며, 실제 값은 아래 등록 폼에 직접 입력해주세요.*"
+            )
 
     with st.expander("새 물품 등록", expanded=False):
         with st.form("new_equipment"):
@@ -773,6 +815,7 @@ def screen_equipment():
                         ),
                     )
                     conn.commit()
+                    st.session_state.pop("equipment_photo_analysis", None)
                     st.success("등록되었습니다.")
                     st.rerun()
 
@@ -797,6 +840,11 @@ def screen_equipment():
                 f"희망 가격: {r['asking_price'] or '확인 필요'} · 수거 조건: {r['pickup_terms'] or '확인 필요'}"
             )
 
+            interests = get_equipment_interests(conn, r["id"])
+            if interests:
+                buyers = ", ".join(i["buyer_user_id"] for i in interests)
+                st.info(f"관심 표시 {len(interests)}명: {buyers}")
+
             style = st.radio(
                 "판매 글 스타일", ["짧은 글", "블로그 스타일"], horizontal=True, key=f"style_{r['id']}"
             )
@@ -813,7 +861,7 @@ def screen_equipment():
                 if predicted.get("ok"):
                     low, high = predicted["price_range"]
                     st.info(
-                        f"🤖 AI 추천가: {predicted['predicted_price']:,}원 "
+                        f"AI 추천가: {predicted['predicted_price']:,}원 "
                         f"(유사 사례 {low:,}~{high:,}원, {predicted['sample_size']}건) · {predicted['message']}"
                     )
                 elif predicted.get("message"):
@@ -859,7 +907,7 @@ def screen_equipment():
 
             if r["status"] == "처분 완료":
                 if r.get("final_price"):
-                    st.caption(f"✅ 실제 판매가 기록됨: {r['final_price']:,}원 (AI 시세 학습에 반영됨)")
+                    st.caption(f"실제 판매가 기록됨: {r['final_price']:,}원 (AI 시세 학습에 반영됨)")
                 else:
                     final_price_input = st.text_input(
                         "실제 판매가 (원, 다음 AI 추천가 정확도를 높이는 데 쓰여요)",
@@ -886,7 +934,7 @@ def screen_marketplace():
     business_options = ["선택 안 함"] + list(BUSINESS_TYPE_CATEGORIES.keys())
 
     business_type = st.selectbox(
-        "🎯 준비 중인 업종 (고르면 관련도 높은 매물을 위로 추천해드려요)", business_options
+        "준비 중인 업종 (고르면 관련도 높은 매물을 위로 추천해드려요)", business_options
     )
     c1, c2 = st.columns(2)
     with c1:
@@ -928,7 +976,7 @@ def screen_marketplace():
 
             if business:
                 match_score = score_equipment_match(item, business)
-                st.progress(match_score / 100, text=f"🎯 {business} 창업 추천도 {match_score}/100")
+                st.progress(match_score / 100, text=f"{business} 창업 추천도 {match_score}/100")
 
             item_category = item.get("category")
             if item_category and item_category not in samples_by_category:
@@ -944,9 +992,9 @@ def screen_marketplace():
                         (predicted["predicted_price"] - asking_num) / predicted["predicted_price"] * 100
                     )
                     if diff_pct > 0:
-                        st.markdown(f":green[🤖 AI 추정 시세 대비 약 {diff_pct}% 저렴]")
+                        st.markdown(f":green[AI 추정 시세 대비 약 {diff_pct}% 저렴]")
                     elif diff_pct < 0:
-                        st.markdown(f":orange[🤖 AI 추정 시세 대비 약 {-diff_pct}% 비쌈]")
+                        st.markdown(f":orange[AI 추정 시세 대비 약 {-diff_pct}% 비쌈]")
 
             if item.get("draft"):
                 with st.expander("판매 글 보기"):
@@ -987,7 +1035,7 @@ if "current_page" not in st.session_state:
     st.session_state["current_page"] = "폐업 진행 상황"
 
 st.sidebar.title("다음걸음")
-st.sidebar.caption(f"👤 {current_user_id()}")
+st.sidebar.caption(current_user_id())
 if st.sidebar.button("다른 이름으로 시작", key="logout", use_container_width=True):
     st.session_state.clear()
     st.rerun()

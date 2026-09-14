@@ -5,6 +5,7 @@
 .env 예시는 .env.example 참고. .env는 git에 커밋하지 않는다.
 """
 import os
+import secrets
 from pathlib import Path
 
 
@@ -43,6 +44,13 @@ LLM_API_KEY = os.environ.get("LLM_API_KEY")
 LLM_MODEL = os.environ.get("LLM_MODEL", "gemini-3.6-flash")
 # 가이드 RAG 검색에 쓰는 임베딩 모델. 생성용 LLM_MODEL과 별도로 관리한다.
 EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "gemini-embedding-001")
+
+# api.py(FastAPI)의 세션 쿠키 서명키. 설정 안 하면 프로세스 시작마다 무작위로
+# 새로 생성한다 — 하드코딩된 기본값을 두면 그 자체가 보안 구멍이 되므로,
+# 대신 "서버 재시작 시 기존 세션이 전부 무효화됨(다시 로그인 필요)"을
+# 감수한다. 여러 인스턴스로 띄우거나 재시작해도 세션을 유지하려면 .env에
+# 직접 값을 채워 넣는다.
+API_SESSION_SECRET = os.environ.get("API_SESSION_SECRET") or secrets.token_hex(32)
 
 
 def bizinfo_configured() -> bool:

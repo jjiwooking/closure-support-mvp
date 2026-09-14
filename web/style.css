@@ -1,0 +1,242 @@
+:root {
+  --main: #ffffff;
+  --accent: #15803d;
+  --accent-bg: #f0fdf4;
+  --text: #111827;
+  --muted: #6b7280;
+  --border: #e5e7eb;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  font-family: "Pretendard", -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+  background: var(--main);
+  color: var(--text);
+}
+
+/* !important 필요: 아래 #login-view/#app-view가 각각 display:flex를 주는데,
+ID 선택자가 이 클래스 선택자보다 우선순위가 높아서 !important 없이는
+hidden 속성이 무시된다. */
+[hidden] { display: none !important; }
+
+/* ---------- 로그인 화면 ---------- */
+#login-view {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+}
+
+.login-card {
+  max-width: 420px;
+  width: 100%;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 32px;
+}
+
+.login-card h1 { margin: 0 0 12px; font-size: 1.6rem; }
+.login-card p { color: var(--muted); font-size: 0.92rem; }
+.login-card .api-hint { margin-top: 16px; font-size: 0.8rem; }
+.login-card code { background: var(--accent-bg); padding: 2px 5px; border-radius: 4px; }
+
+#login-form {
+  display: flex;
+  gap: 8px;
+  margin-top: 16px;
+}
+
+#login-form input {
+  flex: 1;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 1rem;
+  font-family: inherit;
+}
+
+.error { color: #b91c1c; font-size: 0.9rem; }
+
+/* ---------- 버튼/입력 공통 ---------- */
+button {
+  font-family: inherit;
+  font-size: 1rem;
+  padding: 10px 18px;
+  border-radius: 6px;
+  border: none;
+  background: var(--accent);
+  color: #fff;
+  cursor: pointer;
+}
+
+button:hover { opacity: 0.9; }
+button:disabled { opacity: 0.5; cursor: not-allowed; }
+
+button.secondary {
+  background: transparent;
+  color: var(--text);
+  border: 1px solid var(--border);
+}
+
+button.full-width { width: 100%; }
+
+/* ---------- 앱 레이아웃 ---------- */
+#app-view {
+  display: flex;
+  min-height: 100vh;
+}
+
+.sidebar {
+  width: 240px;
+  flex-shrink: 0;
+  background: var(--accent-bg);
+  padding: 20px;
+  border-right: 1px solid var(--border);
+}
+
+.sidebar h1 { font-size: 1.3rem; margin: 0 0 4px; }
+.sidebar .user-name { color: var(--muted); font-size: 0.85rem; margin: 0 0 12px; }
+.sidebar hr { border: none; border-top: 1px solid var(--border); margin: 16px 0; }
+.sidebar h3 { font-size: 0.8rem; color: var(--muted); margin: 18px 0 6px; font-weight: 500; }
+
+nav .nav-btn {
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: transparent;
+  color: var(--text);
+  padding: 9px 10px;
+  margin-bottom: 2px;
+  border-radius: 6px;
+}
+
+nav .nav-btn:hover { background: rgba(21, 128, 61, 0.1); }
+nav .nav-btn.active { background: var(--accent); color: #fff; }
+
+#main-content {
+  flex: 1;
+  padding: 32px 40px;
+  max-width: 860px;
+}
+
+/* ---------- 대시보드 ---------- */
+.stats {
+  display: flex;
+  gap: 16px;
+  margin: 20px 0 28px;
+  flex-wrap: wrap;
+}
+
+.stat {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 14px 18px;
+  min-width: 150px;
+}
+
+.stat span { display: block; color: var(--muted); font-size: 0.82rem; margin-bottom: 4px; }
+.stat strong { font-size: 1.3rem; }
+
+#task-list { list-style: none; padding: 0; }
+
+#task-list li {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+#task-list li .due { margin-left: auto; color: var(--muted); font-size: 0.85rem; }
+
+/* ---------- 챗봇 ---------- */
+#chat-messages {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 16px;
+  min-height: 300px;
+  max-height: 55vh;
+  overflow-y: auto;
+  margin-bottom: 12px;
+}
+
+.msg { margin-bottom: 16px; }
+.msg .role { font-size: 0.78rem; color: var(--muted); margin-bottom: 4px; }
+.msg.user .bubble { background: var(--accent-bg); }
+.msg.assistant .bubble { background: #fff; border: 1px solid var(--border); }
+.msg .agent-badge { font-size: 0.78rem; color: var(--accent); font-weight: 600; margin-bottom: 4px; }
+.bubble { padding: 10px 14px; border-radius: 8px; white-space: pre-wrap; line-height: 1.5; }
+
+#chat-form { display: flex; gap: 8px; }
+#chat-form input { flex: 1; padding: 10px 12px; border: 1px solid var(--border); border-radius: 6px; font-family: inherit; font-size: 1rem; }
+
+/* ---------- 정책 목록 ---------- */
+.policy-card {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 16px;
+  margin-bottom: 12px;
+}
+
+.policy-card h3 { margin: 0 0 6px; }
+.score-bar { height: 6px; background: var(--border); border-radius: 3px; margin: 10px 0 6px; overflow: hidden; }
+.score-bar span { display: block; height: 100%; background: var(--accent); }
+
+.loading, .empty { color: var(--muted); padding: 20px 0; }
+
+/* 카드/폼 안에서 두루 쓰는 보조 텍스트·버튼 줄 — 정책/중고품/사진인식 폼이 공유 */
+.meta { color: var(--muted); font-size: 0.85rem; margin-bottom: 4px; }
+.actions { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; align-items: center; }
+.actions button { font-size: 0.85rem; padding: 7px 12px; }
+.actions input[type="file"] { font-size: 0.85rem; }
+
+/* ---------- 중고품/설비 매칭 (정책 카드와 동일한 형태 재사용) ---------- */
+.item-card {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 16px;
+  margin-bottom: 12px;
+}
+
+.item-card h3 { margin: 0 0 6px; }
+.item-card .price-diff { font-size: 0.85rem; font-weight: 600; margin-top: 6px; }
+.item-card .price-diff.cheap { color: var(--accent); }
+.item-card .price-diff.pricey { color: #c2410c; }
+.item-card .draft-box, .draft-box {
+  margin-top: 10px;
+  padding: 10px 12px;
+  background: var(--accent-bg);
+  border-radius: 6px;
+  font-size: 0.88rem;
+  white-space: pre-wrap;
+}
+.item-card select { padding: 6px 8px; border: 1px solid var(--border); border-radius: 6px; font-family: inherit; }
+
+.filter-bar { display: flex; gap: 10px; margin: 16px 0 20px; flex-wrap: wrap; }
+.filter-bar select { padding: 8px 10px; border: 1px solid var(--border); border-radius: 6px; font-family: inherit; }
+
+.equipment-form-wrap {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 14px 16px;
+  margin-bottom: 20px;
+}
+.equipment-form-wrap summary { cursor: pointer; font-weight: 600; }
+.equipment-form-wrap[open] summary { margin-bottom: 12px; }
+
+.equipment-form {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+.equipment-form input, .equipment-form select {
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-family: inherit;
+  font-size: 0.92rem;
+}
+.equipment-form button { grid-column: 1 / -1; }

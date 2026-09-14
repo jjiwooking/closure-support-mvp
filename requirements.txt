@@ -2,3 +2,7 @@ streamlit>=1.38
 langgraph>=1.2
 chromadb>=1.5
 scikit-learn>=1.5
+fastapi>=0.115
+uvicorn>=0.30
+itsdangerous>=2.2
+python-multipart>=0.0.9

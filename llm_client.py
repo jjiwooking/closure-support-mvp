@@ -4,10 +4,20 @@ LLM 호출 뼈대. 현재는 Gemini REST API만 지원한다(LLM_PROVIDER="gemin
 호출부(coaching.py, guide_graph.py, rag_store.py)가 규칙 기반 문구로 안전하게
 폴백할 수 있게 한다.
 
+이 모듈은 어떤 UI 프레임워크도 몰라야 한다 — services.py/analytics.py/
+guide_graph.py 등 나머지 로직 계층과 마찬가지로, 지금의 app.py(Streamlit)를
+나중에 다른 프레임워크로 바꾸더라도 이 파일은 손댈 필요가 없어야 한다는
+원칙을 지킨다.
+
 할당량 보호: generate_text/generate_text_with_search/generate_embedding
-세 호출 모두 이 모듈의 프로세스당 호출 수 상한을 공유한다. 상한에 도달하면
-API를 부르지 않고 바로 실패를 반환해 호출부가 조용히 폴백하게 한다(검수기준
-"API 장애에도 기본 안내 제공"과 같은 취지).
+세 호출 모두 호출 수 상한을 공유한다. 이 카운터를 "어디에 저장할지"는
+실행 환경마다 다르므로(Streamlit 세션, 웹 요청 컨텍스트 등) 직접 정하지
+않고 set_quota_backend()로 주입받는다 — 기본값은 프로세스 전역 카운터라
+오프라인 스크립트에서 이 모듈만 불러 써도 바로 동작한다. app.py는
+시작할 때 st.session_state 기반 카운터를 넣어, 로그인으로 여러 사용자가
+한 프로세스를 같이 써도 한 사용자가 다른 사용자 몫을 깎아먹지 않게 한다.
+상한에 도달하면 API를 부르지 않고 바로 실패를 반환해 호출부가 조용히
+폴백하게 한다(검수기준 "API 장애에도 기본 안내 제공"과 같은 취지).
 """
 import base64
 import json
@@ -19,18 +29,41 @@ from config import EMBEDDING_MODEL, LLM_API_KEY, LLM_MODEL, LLM_PROVIDER, llm_co
 GEMINI_ENDPOINT_TMPL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 GEMINI_EMBED_ENDPOINT_TMPL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:embedContent"
 
-MAX_LLM_CALLS_PER_PROCESS = 60
+MAX_LLM_CALLS_PER_SESSION = 60
 
-_llm_call_count = 0
+_fallback_call_count = 0  # 기본 카운터: set_quota_backend()를 아무도 안 부르면 이걸 쓴다.
+
+
+def _default_get_count() -> int:
+    return _fallback_call_count
+
+
+def _default_increment() -> None:
+    global _fallback_call_count
+    _fallback_call_count += 1
+
+
+_get_count = _default_get_count
+_increment_count = _default_increment
+
+
+def set_quota_backend(get_count_fn, increment_fn) -> None:
+    """호출 횟수 카운터의 저장 위치를 갈아끼운다. get_count_fn()은 현재
+    카운트(int)를, increment_fn()은 그 카운트를 1 늘리는 부수효과를 낸다.
+    app.py가 Streamlit 세션별 카운터를 여기에 연결한다. 이 함수를 아무도
+    호출하지 않으면(예: 이 모듈만 불러 쓰는 오프라인 스크립트) 프로세스
+    전역 폴백 카운터가 그대로 쓰인다."""
+    global _get_count, _increment_count
+    _get_count = get_count_fn
+    _increment_count = increment_fn
 
 
 def _quota_available() -> bool:
-    return _llm_call_count < MAX_LLM_CALLS_PER_PROCESS
+    return _get_count() < MAX_LLM_CALLS_PER_SESSION
 
 
 def _record_call():
-    global _llm_call_count
-    _llm_call_count += 1
+    _increment_count()
 
 
 def _post_gemini(url: str, body: dict) -> dict:
@@ -42,7 +75,7 @@ def _post_gemini(url: str, body: dict) -> dict:
         return {"ok": False, "data": None, "error": f"미지원 LLM_PROVIDER: {LLM_PROVIDER} (현재 gemini만 지원)"}
 
     if not _quota_available():
-        return {"ok": False, "data": None, "error": "프로세스당 LLM 호출 상한에 도달했습니다."}
+        return {"ok": False, "data": None, "error": "이 세션의 LLM 호출 상한에 도달했습니다."}
 
     req = urllib.request.Request(
         url,
@@ -59,6 +92,11 @@ def _post_gemini(url: str, body: dict) -> dict:
         return {"ok": False, "data": None, "error": f"Gemini API 오류({exc.code}): {detail}"}
     except urllib.error.URLError as exc:
         return {"ok": False, "data": None, "error": f"Gemini API 연결 실패: {exc}"}
+    except TimeoutError:
+        # urlopen(timeout=20)이 연결 자체가 아니라 응답을 읽는 도중(response.begin())
+        # 타임아웃되면 URLError로 감싸지지 않고 순수 TimeoutError가 그대로 올라온다.
+        # 이걸 못 잡으면 호출부가 폴백할 기회 없이 요청 전체가 처리되지 않은 예외로 죽는다.
+        return {"ok": False, "data": None, "error": "Gemini API 응답 시간 초과"}
 
     _record_call()
     return {"ok": True, "data": data, "error": None}
