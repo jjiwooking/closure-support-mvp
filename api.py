@@ -10,6 +10,7 @@ supervisor_graph.py 등 로직 계층 함수는 그대로 호출만 하고 시�
 
 실행: uvicorn api:app --reload --port 8000
 """
+import threading
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from typing import Literal
@@ -31,15 +32,20 @@ from llm_client import classify_product_image
 from supervisor_graph import run_supervisor
 
 
-# ---------- DB 연결: Streamlit의 st.cache_resource와 동일한 절충 — 앱 시작 시
-# 1회 생성해 요청마다 재사용한다. SQLite 동시쓰기 한계는 별도 작업(Postgres
-# 마이그레이션)에서 다룬다. ----------
+# ---------- DB 연결: 요청마다 새 연결을 열고 끝나면 닫는다. 처음엔 Streamlit의
+# st.cache_resource처럼 연결 하나를 앱 시작 시 만들어 계속 재사용했는데, 이 파일의
+# 라우트는 전부 동기 def라 FastAPI가 각 요청을 스레드풀의 서로 다른 스레드에서
+# 돌린다 — sqlite3 연결 하나를 여러 스레드가 동시에 쓰면(check_same_thread=False로
+# 에러는 안 나도) 요청끼리 커밋되지 않은 쓰기 상태를 공유하게 되어, 한 요청의
+# 절반만 끝난 트랜잭션을 다른 요청이 보거나 뒤섞일 수 있다. SQLite 연결은 열고
+# 닫는 비용이 작으니 요청마다 새로 여는 쪽이 안전하다. 동시 "쓰기" 자체의 처리량
+# 한계(파일 잠금)는 별도 작업(Postgres 마이그레이션)에서 다룬다. ----------
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     conn = db.get_connection()
     db.init_db(conn)
-    app.state.conn = conn
+    conn.close()
     yield
 
 
@@ -60,31 +66,73 @@ app.add_middleware(
 )
 
 
-def get_db(request: Request):
-    return request.app.state.conn
+def get_db():
+    conn = db.get_connection()
+    try:
+        yield conn
+    finally:
+        conn.close()
 
 
 # ---------- LLM 쿼터: 요청별 사용자를 ContextVar로 식별해 llm_client.py에 주입.
-# Streamlit은 세션마다 별도 스레드라 모듈 전역변수를 못 썼지만(과거 버그 참고),
-# FastAPI는 요청마다 asyncio 컨텍스트가 올바르게 격리되므로 ContextVar로 충분하다.
-# ----------
+# 주의(중요, 실제로 겪은 버그): ContextVar만으로는 충분하지 않다. FastAPI는 동기
+# 의존성(get_current_user)과 동기 라우트 본문을 서로 다른 run_in_threadpool 호출로
+# 각각 실행하는데, anyio가 호출마다 현재 컨텍스트를 새로 복사해서 워커 스레드에
+# 넘기기 때문에 의존성 쪽에서 set()한 값이 라우트 본문 쪽엔 전혀 보이지 않는다
+# (실제로 재현해서 확인함 — 의존성에서 set()해도 라우트 본문에서 get()하면 항상
+# None). 그래서 set()은 Depends 안이 아니라, LLM을 실제로 부르는 라우트 본문의
+# 맨 앞에서 _bind_quota_user()로 직접 해야 한다(아래 함수 및 각 호출부 참고). ----------
 
 _current_user_var: ContextVar[str | None] = ContextVar("current_user", default=None)
 _quota_by_user: dict[str, int] = {}
 
 
+_quota_lock = threading.Lock()
+
+
 def _get_quota_count() -> int:
     user = _current_user_var.get()
-    return _quota_by_user.get(user, 0) if user else 0
+    with _quota_lock:
+        return _quota_by_user.get(user, 0) if user else 0
 
 
 def _increment_quota() -> None:
     user = _current_user_var.get()
     if user:
-        _quota_by_user[user] = _quota_by_user.get(user, 0) + 1
+        with _quota_lock:
+            _quota_by_user[user] = _quota_by_user.get(user, 0) + 1
 
 
 llm_client.set_quota_backend(_get_quota_count, _increment_quota)
+
+
+def _bind_quota_user(user_id: str) -> None:
+    """LLM을 실제로 호출하는 엔드포인트 본문 맨 앞에서 불러야 한다 — Depends(get_current_user)
+    안에서 이걸 하면 안 된다. FastAPI는 동기 의존성과 동기 라우트 본문을 서로 다른
+    run_in_threadpool 호출로 각각 실행하는데, anyio가 그 호출마다 현재 컨텍스트를
+    새로 복사해서 워커 스레드에 넘기기 때문에, 의존성 쪽 스레드에서 한 ContextVar.set()은
+    라우트 본문 쪽의 (별도로 복사된) 컨텍스트로 전파되지 않는다. 실제로 재현해서 확인함:
+    의존성에서 set()해도 라우트 본문에서 get()하면 항상 None이 나와, 세션당 LLM 호출
+    상한(MAX_LLM_CALLS_PER_SESSION)이 FastAPI 쪽에서는 사실상 전혀 걸리지 않고 있었다.
+    이 함수를 LLM을 부르는 라우트 본문 안에서 직접 부르면, set()과 이후의 get()이
+    같은 threadpool 호출(같은 컨텍스트) 안에서 일어나므로 정상 작동한다."""
+    _current_user_var.set(user_id)
+
+
+# ---------- 챗봇 후속 질문 맥락(focus): supervisor_graph.run_supervisor()는 "그거
+# 얼마야?" 같은 후속 질문을 이어받으려면 호출부가 focus를 세션별로 들고 있다가
+# 매 턴 넘겨줘야 한다(app.py는 st.session_state로 함). api.py는 요청마다 상태가
+# 없으므로, user_id+stage_key 조합별로 서버 메모리에 들고 있는다 — quota 카운터와
+# 같은 절충(프로세스 재시작하면 초기화됨, 여러 워커로 띄우면 워커마다 따로 놈).
+# 이게 없으면(원래 빠져 있었음) API로는 후속 질문이 항상 목록형 폴백으로만 답해져
+# Streamlit 버전과 다르게 동작했다. ----------
+
+_focus_by_user_stage: dict[tuple[str, str], dict] = {}
+_focus_lock = threading.Lock()
+
+
+class OkOut(BaseModel):
+    ok: bool = True
 
 
 # ---------- 인증: 이름만 입력하는 세션 쿠키(Streamlit 로그인과 동일한 보안 수준,
@@ -94,7 +142,6 @@ def get_current_user(request: Request) -> str:
     user_id = request.session.get("user_id")
     if not user_id:
         raise HTTPException(status_code=401, detail="로그인이 필요합니다.")
-    _current_user_var.set(user_id)
     return user_id
 
 
@@ -121,10 +168,10 @@ def me(user_id: str = Depends(get_current_user)):
     return UserOut(user_id=user_id)
 
 
-@app.post("/auth/logout")
+@app.post("/auth/logout", response_model=OkOut)
 def logout(request: Request):
     request.session.clear()
-    return {"ok": True}
+    return OkOut()
 
 
 # ---------- 대시보드/업무: app.py의 get_profile()/get_tasks()와 동일한 쿼리를
@@ -198,12 +245,14 @@ class TaskUpdate(BaseModel):
     status: str
 
 
-@app.patch("/tasks/{task_id}")
+@app.patch("/tasks/{task_id}", response_model=OkOut)
 def update_task(
     task_id: int, body: TaskUpdate, user_id: str = Depends(get_current_user), conn=Depends(get_db)
 ):
-    services.update_task_status(conn, task_id, body.status, user_id)
-    return {"ok": True}
+    ok = services.update_task_status(conn, task_id, body.status, user_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="업무를 찾을 수 없습니다.")
+    return OkOut()
 
 
 # ---------- 챗봇(멀티에이전트) — 이번 슬라이스의 핵심. supervisor_graph가 API로도
@@ -224,11 +273,17 @@ class ChatResponse(BaseModel):
 def chat(
     body: ChatRequest, user_id: str = Depends(get_current_user), conn=Depends(get_db)
 ):
+    _bind_quota_user(user_id)
     tasks = _get_tasks(conn, user_id, body.stage_key)
     if not tasks:
         raise HTTPException(status_code=404, detail="해당 단계에 등록된 업무가 없습니다.")
     profile = _get_profile(conn, user_id)
-    result = run_supervisor(conn, tasks, body.question, user_id, profile)
+    focus_key = (user_id, body.stage_key)
+    with _focus_lock:
+        focus = _focus_by_user_stage.get(focus_key) or {}
+    result = run_supervisor(conn, tasks, body.question, user_id, profile, focus=focus)
+    with _focus_lock:
+        _focus_by_user_stage[focus_key] = result.get("focus") or {}
     return ChatResponse(
         answer=result["answer"],
         agent_name=result.get("agent_name", ""),
@@ -324,21 +379,25 @@ def _get_own_equipment(conn, equipment_id: int, user_id: str) -> dict:
     return dict(row)
 
 
-def _equipment_out(conn, row: dict) -> EquipmentOut:
-    interests = services.get_equipment_interests(conn, row["id"])
+def _equipment_out(conn, row: dict, interest_count: int | None = None) -> EquipmentOut:
+    if interest_count is None:
+        interest_count = len(services.get_equipment_interests(conn, row["id"]))
     return EquipmentOut(
         id=row["id"], name=row["name"], category=row.get("category"), region=row.get("region"),
         model=row.get("model"), used_period=row.get("used_period"), condition=row.get("condition"),
         defects=row.get("defects"), asking_price=row.get("asking_price"), pickup_terms=row.get("pickup_terms"),
         draft=row.get("draft"), status=row["status"], payment_status=row["payment_status"],
-        final_price=row.get("final_price"), interest_count=len(interests),
+        final_price=row.get("final_price"), interest_count=interest_count,
     )
 
 
 @app.get("/equipment", response_model=list[EquipmentOut])
 def list_equipment(user_id: str = Depends(get_current_user), conn=Depends(get_db)):
     rows = services.get_user_equipment(conn, user_id)
-    return [_equipment_out(conn, r) for r in rows]
+    # 물품마다 get_equipment_interests()를 따로 부르면 N+1 쿼리이므로, 목록 화면에선
+    # 개수만 한 번에 모아온다(항목 하나만 다루는 create/update 쪽은 그대로 둬도 N+1이 아님).
+    counts = services.get_interest_counts(conn, [r["id"] for r in rows])
+    return [_equipment_out(conn, r, counts.get(r["id"], 0)) for r in rows]
 
 
 @app.post("/equipment", response_model=EquipmentOut, status_code=201)
@@ -408,6 +467,7 @@ def generate_equipment_listing(
     equipment_id: int, body: ListingRequest,
     user_id: str = Depends(get_current_user), conn=Depends(get_db),
 ):
+    _bind_quota_user(user_id)
     item = _get_own_equipment(conn, equipment_id, user_id)
     result = trade_graph.run_trade(conn, item, style=body.style)
     conn.execute("UPDATE equipment SET draft=? WHERE id=?", (result["draft"], equipment_id))
@@ -425,7 +485,7 @@ class SaleRequest(BaseModel):
     price_text: str
 
 
-@app.post("/equipment/{equipment_id}/sale")
+@app.post("/equipment/{equipment_id}/sale", response_model=OkOut)
 def record_sale(
     equipment_id: int, body: SaleRequest,
     user_id: str = Depends(get_current_user), conn=Depends(get_db),
@@ -434,7 +494,7 @@ def record_sale(
     ok = services.record_equipment_sale(conn, equipment_id, body.price_text)
     if not ok:
         raise HTTPException(status_code=422, detail="판매가를 해석할 수 없습니다. 숫자로 입력해주세요(예: 120만원).")
-    return {"ok": True}
+    return OkOut()
 
 
 # ---------- 설비 매칭: app.py screen_marketplace()와 동일한 필터+업종 추천 랭킹+
@@ -500,7 +560,7 @@ def list_marketplace(
     return out
 
 
-@app.post("/marketplace/{equipment_id}/interest")
+@app.post("/marketplace/{equipment_id}/interest", response_model=OkOut)
 def express_interest(
     equipment_id: int, user_id: str = Depends(get_current_user), conn=Depends(get_db)
 ):
@@ -508,7 +568,7 @@ def express_interest(
     if not row:
         raise HTTPException(status_code=404, detail="물품을 찾을 수 없습니다.")
     services.record_marketplace_interest(conn, user_id, equipment_id)
-    return {"ok": True}
+    return OkOut()
 
 
 # ---------- 사진인식: app.py screen_equipment()의 "사진으로 물품 인식"과 동일하게,
@@ -524,13 +584,21 @@ class PhotoAnalysisOut(BaseModel):
 
 
 @app.post("/equipment/photo-analysis", response_model=PhotoAnalysisOut)
-async def analyze_equipment_photo(
+def analyze_equipment_photo(
     photo: UploadFile = File(...), user_id: str = Depends(get_current_user)
 ):
+    # 이 파일의 다른 엔드포인트처럼 일부러 async def가 아닌 일반 def로 둔다 —
+    # classify_product_image()가 내부에서 urllib.request.urlopen()을 동기(blocking)로
+    # 호출하는데, async def 라우트 안에서 그대로 부르면 asyncio 이벤트 루프 자체를
+    # 막아 그 워커가 처리 중인 다른 모든 요청이 최대 20초(LLM 타임아웃)까지 지연된다.
+    # 동기 def 라우트는 FastAPI가 자동으로 스레드풀에서 돌리므로 이 문제가 없다.
+    # UploadFile.read()는 코루틴이라 동기 함수에서 await할 수 없으니, 대신 내부
+    # SpooledTemporaryFile에 동기로 직접 접근한다(FastAPI 공식 문서에 안내된 방식).
+    _bind_quota_user(user_id)
     mime_type = photo.content_type or "image/jpeg"
     if mime_type not in ALLOWED_PHOTO_TYPES:
         raise HTTPException(status_code=422, detail="JPG 또는 PNG 이미지만 지원합니다.")
-    image_bytes = await photo.read()
+    image_bytes = photo.file.read()
     result = classify_product_image(image_bytes, mime_type)
     if not result["ok"]:
         raise HTTPException(status_code=502, detail=f"사진 분석에 실패했습니다: {result['error']}")

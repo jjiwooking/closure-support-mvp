@@ -41,14 +41,22 @@ def log_change(conn, user_id, entity_type, entity_id, before_value, after_value)
 
 
 def update_task_status(conn, task_id, new_status, user_id):
-    row = conn.execute("SELECT status FROM user_tasks WHERE id=?", (task_id,)).fetchone()
-    before = row["status"] if row else None
+    """user_id 소유가 아닌 task_id면 아무것도 바꾸지 않고 False를 반환한다 —
+    app.py는 항상 user_id로 미리 필터링된 task["id"]만 넘기므로 영향이 없지만,
+    api.py는 task_id를 URL 경로에서 그대로 받으므로 이 체크가 없으면 다른
+    사용자의 task를 임의로 바꿀 수 있었다(IDOR)."""
+    row = conn.execute(
+        "SELECT status FROM user_tasks WHERE id=? AND user_id=?", (task_id, user_id)
+    ).fetchone()
+    if row is None:
+        return False
     conn.execute(
-        "UPDATE user_tasks SET status=?, updated_at=? WHERE id=?",
-        (new_status, datetime.utcnow().isoformat(), task_id),
+        "UPDATE user_tasks SET status=?, updated_at=? WHERE id=? AND user_id=?",
+        (new_status, datetime.utcnow().isoformat(), task_id, user_id),
     )
     conn.commit()
-    log_change(conn, user_id, "user_task", task_id, before, new_status)
+    log_change(conn, user_id, "user_task", task_id, row["status"], new_status)
+    return True
 
 
 def toggle_document_check(conn, check_id, checked, user_id):
@@ -528,6 +536,21 @@ def get_equipment_interests(conn, equipment_id):
         (equipment_id,),
     ).fetchall()
     return [dict(r) for r in rows]
+
+
+def get_interest_counts(conn, equipment_ids):
+    """equipment_ids 각각의 관심 표시 개수를 한 번의 쿼리로 가져온다. 물품 목록
+    화면에서 물품마다 get_equipment_interests()를 따로 부르면 N+1 쿼리가 되므로,
+    개수만 필요한 목록 뷰에서는 이걸 대신 쓴다."""
+    if not equipment_ids:
+        return {}
+    placeholders = ",".join("?" * len(equipment_ids))
+    rows = conn.execute(
+        f"SELECT equipment_id, COUNT(*) as cnt FROM marketplace_interests "
+        f"WHERE equipment_id IN ({placeholders}) GROUP BY equipment_id",
+        equipment_ids,
+    ).fetchall()
+    return {r["equipment_id"]: r["cnt"] for r in rows}
 
 
 # ---------- 집기 판매 글 생성 (입력된 사실만 사용, 미입력 항목은 "확인 필요"로 표기) ----------

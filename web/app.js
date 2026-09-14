@@ -91,8 +91,14 @@ loginForm.addEventListener("submit", async (e) => {
 });
 
 document.getElementById("logout-btn").addEventListener("click", async () => {
-  await apiFetch("/auth/logout", { method: "POST" }).catch(() => {});
-  location.reload();
+  try {
+    await apiFetch("/auth/logout", { method: "POST" });
+    location.reload();
+  } catch (err) {
+    // 서버 세션이 실제로는 안 끊겼을 수 있으니, 성공했을 때만 새로고침한다 —
+    // 공용 컴퓨터에서 로그아웃했다고 믿었는데 세션이 살아있으면 안 되기 때문.
+    alert(`로그아웃에 실패했습니다: ${err.message}`);
+  }
 });
 
 function enterApp(userId) {
@@ -138,13 +144,21 @@ async function renderDashboard() {
       const checked = t.status === "사용자 완료";
       li.innerHTML = `
         <input type="checkbox" ${checked ? "checked" : ""} data-task-id="${t.id}">
-        <span>[${STAGE_LABELS[t.stage] || t.stage}] ${escapeHtml(t.task_title)}</span>
+        <span>[${escapeHtml(STAGE_LABELS[t.stage] || t.stage)}] ${escapeHtml(t.task_title)}</span>
         <span class="due">${t.due_date || "기한 미정"}</span>
       `;
       li.querySelector("input").addEventListener("change", async (e) => {
-        const newStatus = e.target.checked ? "사용자 완료" : "진행 중";
-        await apiFetch(`/tasks/${t.id}`, { method: "PATCH", body: JSON.stringify({ status: newStatus }) });
-        renderDashboard();
+        const checkbox = e.target;
+        const newStatus = checkbox.checked ? "사용자 완료" : "진행 중";
+        checkbox.disabled = true;
+        try {
+          await apiFetch(`/tasks/${t.id}`, { method: "PATCH", body: JSON.stringify({ status: newStatus }) });
+          renderDashboard();
+        } catch (err) {
+          checkbox.checked = !checkbox.checked;
+          checkbox.disabled = false;
+          alert(`저장에 실패했습니다: ${err.message}`);
+        }
       });
       list.appendChild(li);
     });
@@ -299,6 +313,8 @@ async function renderEquipment() {
     errorEl.hidden = true;
     const name = document.getElementById("eq-name").value.trim();
     if (!name) return;
+    const submitBtn = e.target.querySelector("button[type=submit]");
+    submitBtn.disabled = true;
     try {
       await apiFetch("/equipment", {
         method: "POST",
@@ -318,6 +334,7 @@ async function renderEquipment() {
     } catch (err) {
       errorEl.textContent = err.message;
       errorEl.hidden = false;
+      submitBtn.disabled = false;
     }
   });
 
@@ -385,16 +402,36 @@ function wireEquipmentCard(item) {
   if (!card) return;
 
   card.querySelector(".eq-status").addEventListener("change", async (e) => {
-    await apiFetch(`/equipment/${item.id}`, { method: "PATCH", body: JSON.stringify({ status: e.target.value }) });
-    loadEquipmentList();
+    const select = e.target;
+    const previous = item.status;
+    select.disabled = true;
+    try {
+      await apiFetch(`/equipment/${item.id}`, { method: "PATCH", body: JSON.stringify({ status: select.value }) });
+      loadEquipmentList();
+    } catch (err) {
+      select.value = previous;
+      select.disabled = false;
+      alert(`저장에 실패했습니다: ${err.message}`);
+    }
   });
   card.querySelector(".eq-payment").addEventListener("change", async (e) => {
-    await apiFetch(`/equipment/${item.id}`, { method: "PATCH", body: JSON.stringify({ payment_status: e.target.value }) });
-    loadEquipmentList();
+    const select = e.target;
+    const previous = item.payment_status;
+    select.disabled = true;
+    try {
+      await apiFetch(`/equipment/${item.id}`, { method: "PATCH", body: JSON.stringify({ payment_status: select.value }) });
+      loadEquipmentList();
+    } catch (err) {
+      select.value = previous;
+      select.disabled = false;
+      alert(`저장에 실패했습니다: ${err.message}`);
+    }
   });
-  card.querySelector(".eq-gen-btn").addEventListener("click", async () => {
+  const genBtn = card.querySelector(".eq-gen-btn");
+  genBtn.addEventListener("click", async () => {
     const style = card.querySelector(".eq-style").value;
     const resultEl = card.querySelector(".eq-listing-result");
+    genBtn.disabled = true;
     resultEl.textContent = "생성 중...";
     try {
       const res = await apiFetch(`/equipment/${item.id}/listing`, {
@@ -411,6 +448,8 @@ function wireEquipmentCard(item) {
       resultEl.innerHTML = `${priceInfo}<div class="draft-box">${escapeHtml(res.draft)}</div>${tipText}`;
     } catch (err) {
       resultEl.innerHTML = `<p class="error">${escapeHtml(err.message)}</p>`;
+    } finally {
+      genBtn.disabled = false;
     }
   });
 
@@ -419,6 +458,7 @@ function wireEquipmentCard(item) {
     recordBtn.addEventListener("click", async () => {
       const priceText = card.querySelector(".eq-final-price").value.trim();
       if (!priceText) return;
+      recordBtn.disabled = true;
       try {
         await apiFetch(`/equipment/${item.id}/sale`, {
           method: "POST",
@@ -427,6 +467,7 @@ function wireEquipmentCard(item) {
         loadEquipmentList();
       } catch (err) {
         alert(err.message);
+        recordBtn.disabled = false;
       }
     });
   }
@@ -468,7 +509,9 @@ async function renderMarketplace() {
     el.addEventListener("change", loadMarketplaceList)
   );
 
-  await loadMarketplaceList();
+  // 필터를 아직 아무것도 안 고른 첫 렌더는 방금 받아온 allListings 그대로가
+  // 곧 "필터 없음" 결과와 같으므로, 같은 데이터를 다시 요청하지 않고 바로 그린다.
+  renderMarketplaceItems(allListings, false);
 }
 
 async function loadMarketplaceList() {
@@ -484,15 +527,20 @@ async function loadMarketplaceList() {
 
   try {
     const items = await apiFetch(`/marketplace?${params.toString()}`);
-    if (!items.length) {
-      listEl.innerHTML = `<p class="empty">조건에 맞는 판매 중인 설비가 없습니다.</p>`;
-      return;
-    }
-    listEl.innerHTML = items.map((item) => renderMarketplaceCard(item, !!business)).join("");
-    items.forEach((item) => wireMarketplaceCard(item));
+    renderMarketplaceItems(items, !!business);
   } catch (err) {
     listEl.innerHTML = `<p class="error">${escapeHtml(err.message)}</p>`;
   }
+}
+
+function renderMarketplaceItems(items, showMatch) {
+  const listEl = document.getElementById("marketplace-list");
+  if (!items.length) {
+    listEl.innerHTML = `<p class="empty">조건에 맞는 판매 중인 설비가 없습니다.</p>`;
+    return;
+  }
+  listEl.innerHTML = items.map((item) => renderMarketplaceCard(item, showMatch)).join("");
+  items.forEach((item) => wireMarketplaceCard(item));
 }
 
 function renderMarketplaceCard(item, showMatch) {
