@@ -1,11 +1,14 @@
+import json
 from datetime import date
 
 import streamlit as st
 
-from coaching import build_stage_response
+from analytics import BUSINESS_TYPE_CATEGORIES, policy_approval_stats, score_equipment_match, score_policy_fit
 from db import get_connection, init_db
+from pricing_model import parse_price, predict_price
 from research_graph import run_research
 from seed import seed_if_empty
+from supervisor_graph import run_supervisor
 from services import (
     NEXT_STAGE,
     check_stage_complete,
@@ -13,12 +16,15 @@ from services import (
     evaluate_eligibility,
     filter_policies_by_career,
     generate_listing,
+    get_marketplace_listings,
     get_or_create_application,
     get_unread_notifications,
     log_change,
     mark_notification_read,
     priority_sort,
     record_application_date,
+    record_equipment_sale,
+    record_marketplace_interest,
     record_supplement,
     register_policy_interest,
     should_suggest_trade,
@@ -29,9 +35,13 @@ from services import (
     update_decision_status,
     update_profile,
     update_task_status,
+    validate_iso_date,
 )
+from trade_graph import run_trade
 
-USER_ID = "demo_user"
+USER_ID = None  # 로그인 후 아래에서 세션별로 채워짐(더 이상 전역 고정값이 아님)
+EQUIPMENT_CATEGORIES = ["주방/조리기기", "냉장/냉동", "카페/음료기기", "집기/가구", "전자기기", "기타"]
+CONDITION_OPTIONS = ["상", "중", "하"]
 
 st.set_page_config(page_title="다음걸음", layout="wide")
 
@@ -95,8 +105,48 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-conn = get_connection()
-init_db(conn)
+@st.cache_resource
+def _get_app_connection():
+    """Streamlit은 버튼 클릭 등 모든 상호작용마다 스크립트 전체를 재실행하므로,
+    캐싱하지 않으면 DB 연결·스키마 마이그레이션이 매번 반복된다. st.cache_resource로
+    감싸 프로세스당 한 번만 실행되게 한다. 특정 사용자 데모 시드(seed_if_empty)는
+    로그인 전엔 어떤 이름으로 로그인할지 알 수 없으므로 여기서 하지 않고,
+    로그인 직후 별도로 호출한다."""
+    conn = get_connection()
+    init_db(conn)
+    return conn
+
+
+conn = _get_app_connection()
+
+
+def _login_screen():
+    """비밀번호 없는 이름 기반 '로그인'. 심사평 이후 발견된 위험(전역 USER_ID
+    하나를 모든 접속자가 공유해 데이터가 서로 섞이는 문제)을 없애기 위한
+    최소 구현 — 해커톤 데모 범위에 맞춰 이름만으로 구분하고, 같은 이름으로
+    다시 오면 이전 기록을 그대로 이어서 보여준다."""
+    st.title("다음걸음")
+    st.write(
+        "상호명 또는 닉네임을 입력하고 시작하세요. 비밀번호는 없으며, "
+        "같은 이름으로 다시 오면 이전 기록이 이어집니다."
+    )
+    with st.form("login_form"):
+        name_input = st.text_input("상호명 / 닉네임")
+        submitted = st.form_submit_button("시작하기")
+    if submitted:
+        cleaned = name_input.strip()
+        if not cleaned:
+            st.warning("이름을 입력해주세요.")
+        else:
+            st.session_state["user_id"] = cleaned
+            st.rerun()
+
+
+if "user_id" not in st.session_state:
+    _login_screen()
+    st.stop()
+
+USER_ID = st.session_state["user_id"]
 seed_if_empty(conn, USER_ID)
 
 
@@ -294,6 +344,17 @@ def screen_dashboard():
         "폐업은 **폐업 준비 → 폐업 진행 → 폐업 후** 3단계로 진행돼요. "
         "아래 체크리스트에서 바로 완료 처리하거나, 왼쪽 '단계별 코칭' 메뉴에서 AI 코칭을 받을 수 있습니다."
     )
+    with st.expander("🤖 AI 에이전트 구조 보기", expanded=False):
+        st.markdown(
+            "**단계별 코칭 챗봇** 질문 하나에도 여러 에이전트가 역할을 나눠 협업합니다.\n\n"
+            "- 🔀 **라우팅 에이전트**: 질문을 아래 세 전문 에이전트 중 하나로 연결\n"
+            "- 🧭 **가이드 에이전트**: 절차·서류 안내 (RAG 검색 + LLM)\n"
+            "- 📋 **정책상담 에이전트**: 적합도 점수 기반 지원사업 추천 (스코어링 모델 + LLM)\n"
+            "- 💰 **거래상담 에이전트**: 등록 물품의 AI 추천가 안내 (KNN 회귀 모델)\n\n"
+            "백그라운드/화면별로는 이런 에이전트들도 따로 동작해요.\n"
+            "- **정책수집 → 정책구조화 → 매칭** ('지원정책' 화면 관리자용 리서치 버튼)\n"
+            "- **가격추정 → 글초안 → 채널안내** (중고품 등록 후 '판매 글 생성')"
+        )
     render_profile_editor()
     profile = get_profile()
     all_tasks = get_tasks()
@@ -316,13 +377,21 @@ def screen_dashboard():
     render_stage_checklist(all_tasks)
 
 
-def _answer_stage_context(tasks, question_text):
-    """등록된 근거만 사용해 답변을 만들고 대화 형식으로 표시할 텍스트를 반환한다.
-    source_type에 따라 검증된 등록 자료 답변과 미검토 실시간 검색 답변을
-    화면에서 구조적으로 구분해 보여준다."""
-    response = build_stage_response(conn, tasks, question_text, USER_ID)
+def _answer_stage_context(stage_key, tasks, question_text):
+    """라우팅 에이전트(supervisor_graph)가 질문 성격에 따라 가이드/정책상담/거래상담
+    중 알맞은 전문 에이전트에게 위임하고, 그 결과를 대화 형식으로 표시할 텍스트로
+    바꾼다. source_type에 따라 검증된 등록 자료 답변과 미검토 실시간 검색 답변을
+    화면에서 구조적으로 구분해 보여준다.
+
+    stage_key별 chat_focus_*에 직전에 다룬 물품을 기억해두었다가 넘겨서,
+    '그거 얼마야?' 같은 대명사 후속 질문도 거래상담 에이전트가 이어받을 수 있게 한다."""
+    focus_key = f"chat_focus_{stage_key}"
+    focus = st.session_state.get(focus_key) or {}
+    response = run_supervisor(conn, tasks, question_text, USER_ID, get_profile(), focus=focus)
+    st.session_state[focus_key] = response.get("focus") or {}
     text = response["answer"]
     source_type = response.get("source_type", "none")
+    agent_name = response.get("agent_name")
 
     if source_type == "local":
         if response["source_ids"]:
@@ -349,6 +418,8 @@ def _answer_stage_context(tasks, question_text):
         )
     # source_type == "none"이면 response["answer"] 자체가 이미 확인 필요 안내다.
 
+    if agent_name:
+        text = f"*{agent_name}*\n\n{text}"
     return text
 
 
@@ -366,7 +437,7 @@ def render_stage_chat(stage_key, stage_label, tasks):
     user_q = st.chat_input(f"{stage_label} 챗봇에게 물어보세요")
     if user_q:
         st.session_state[history_key].append(("user", user_q))
-        answer = _answer_stage_context(tasks, user_q)
+        answer = _answer_stage_context(stage_key, tasks, user_q)
         st.session_state[history_key].append(("assistant", answer))
         st.rerun()
 
@@ -529,13 +600,64 @@ def screen_policies():
         if st.button("지금 리서치 실행"):
             result = run_research(conn, USER_ID, profile)
             st.success(
-                f"신규 수집 {result['source_count']}건, "
-                f"새로운 맞춤 알림 {result['new_matches']}건"
+                f"🤖 정책수집 에이전트: {result['source_count']}건 수집 → "
+                f"정책구조화 에이전트: {result['extracted_count']}건 AI 초안 작성 → "
+                f"매칭 에이전트: {result['new_matches']}건 새 알림"
             )
         pending = conn.execute(
             "SELECT COUNT(*) AS c FROM sources WHERE review_status != '검토완료'"
         ).fetchone()["c"]
         st.caption(f"검토 대기 중인 자료: {pending}건")
+
+        drafts = conn.execute(
+            """
+            SELECT id, agency, extracted_draft FROM sources
+            WHERE review_status != '검토완료' AND extracted_draft IS NOT NULL
+            """
+        ).fetchall()
+        if drafts:
+            st.markdown("**AI 구조화 초안 검토** (정책구조화 에이전트 결과)")
+            st.caption("추정 조건은 AI가 원문에서 읽은 것이며, 등록 후에도 필요하면 직접 보완할 수 있습니다.")
+        for d in drafts:
+            try:
+                draft = json.loads(d["extracted_draft"])
+            except (json.JSONDecodeError, TypeError):
+                continue
+            with st.container(border=True):
+                st.write(f"**{draft.get('title') or '(제목 확인 필요)'}** · {d['agency']}")
+                st.caption(draft.get("eligibility_summary") or "요약 없음")
+                st.caption(
+                    f"진로 추정: {draft.get('target_career_guess') or '확인 필요'} · "
+                    f"마감일 추정: {draft.get('application_deadline_guess') or '상시/미정'}"
+                )
+                rules_guess = {
+                    k: v for k, v in (draft.get("eligibility_rules_guess") or {}).items() if v
+                }
+                rules_preview = ", ".join(f"{k}={v}" for k, v in rules_guess.items())
+                st.caption(f"추정 조건: {rules_preview or '없음(등록 후 직접 보완 필요)'}")
+                if st.button("이 초안으로 정책 등록", key=f"promote_{d['id']}"):
+                    safe_deadline = validate_iso_date(draft.get("application_deadline_guess"))
+                    eligibility_rules_json = json.dumps(rules_guess, ensure_ascii=False) if rules_guess else "{}"
+                    conn.execute(
+                        """
+                        INSERT INTO policies
+                            (source_id, title, period, eligibility_rules, application_link_id,
+                             availability_status, target_career, application_deadline)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            d["id"], draft.get("title") or "(제목 확인 필요)", "확인 필요", eligibility_rules_json,
+                            None, "모집중",
+                            draft.get("target_career_guess"), safe_deadline,
+                        ),
+                    )
+                    conn.execute(
+                        "UPDATE sources SET review_status='검토완료', reviewed_at=? WHERE id=?",
+                        (date.today().isoformat(), d["id"]),
+                    )
+                    conn.commit()
+                    st.success("등록되었습니다. 세부 조건은 필요 시 직접 보완하세요.")
+                    st.rerun()
 
     career_options = ["모름", "재창업", "취업"]
     current_career = profile.get("career_path") or "모름"
@@ -547,6 +669,13 @@ def screen_policies():
     if new_career != current_career:
         update_career_path(conn, USER_ID, new_career)
         st.rerun()
+
+    approval = policy_approval_stats(conn, current_career)
+    if approval["decided"]:
+        st.caption(
+            f"📊 유사 지원사업 과거 승인율: {approval['rate'] * 100:.0f}% "
+            f"(과거 심사결과 {approval['decided']}건 기준)"
+        )
 
     rows = conn.execute(
         """
@@ -563,8 +692,16 @@ def screen_policies():
         st.info("현재 진로 기준으로 등록된 지원사업이 없습니다.")
         return
 
+    registered_policy_ids = {
+        row["policy_id"]
+        for row in conn.execute(
+            "SELECT policy_id FROM user_tasks WHERE user_id=? AND policy_id IS NOT NULL", (USER_ID,)
+        ).fetchall()
+    }
+
     for r in rows:
         label = evaluate_eligibility(profile, r["eligibility_rules"])
+        fit_score = score_policy_fit(profile, r["eligibility_rules"])
         with st.container(border=True):
             st.subheader(r["title"])
             st.write(f"기관: {r['agency']} · 신청기간: {r.get('period') or '확인 필요'}")
@@ -577,12 +714,10 @@ def screen_policies():
                 "모집 상태 확인 필요": "gray",
             }.get(label, "gray")
             st.markdown(f":{badge_color}[● {label}]")
+            st.progress(fit_score / 100, text=f"🤖 AI 적합도 점수 {fit_score}/100")
             st.caption(f"자료 검토일: {r.get('reviewed_at') or '확인 필요'}")
 
-            existing_task = conn.execute(
-                "SELECT id FROM user_tasks WHERE user_id=? AND policy_id=?", (USER_ID, r["id"])
-            ).fetchone()
-            if existing_task:
+            if r["id"] in registered_policy_ids:
                 st.caption("관심 사업으로 등록됨 — '폐업 준비'/'폐업 진행' 화면에서 진행 상황을 기록하세요.")
             elif st.button("관심 사업으로 등록", key=f"interest_{r['id']}"):
                 _, created = register_policy_interest(conn, r["id"], USER_ID)
@@ -599,9 +734,10 @@ def screen_equipment():
     with st.expander("새 물품 등록", expanded=False):
         with st.form("new_equipment"):
             name = st.text_input("물품명")
+            category = st.selectbox("카테고리", EQUIPMENT_CATEGORIES)
             model = st.text_input("모델 (모르면 비워두세요)")
-            used_period = st.text_input("사용 기간")
-            condition = st.text_input("상태")
+            used_period = st.text_input("사용 기간 (예: 2년, 6개월)")
+            condition = st.selectbox("상태", CONDITION_OPTIONS, index=1)
             defects = st.text_input("하자")
             ownership_status = st.selectbox("본인 소유 확인", ["본인 소유", "확인 필요"])
             asking_price = st.text_input("희망 가격")
@@ -611,16 +747,19 @@ def screen_equipment():
                 if not name:
                     st.warning("물품명은 필수입니다.")
                 else:
+                    region = get_profile().get("region")
                     conn.execute(
                         """
                         INSERT INTO equipment
                             (user_id, name, model, used_period, condition, defects,
-                             ownership_status, asking_price, pickup_terms, draft, status, payment_status)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                             ownership_status, asking_price, pickup_terms, draft, status, payment_status,
+                             category, region)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             USER_ID, name, model, used_period, condition, defects,
                             ownership_status, asking_price, pickup_terms, "", "보관 중", "미입금",
+                            category, region,
                         ),
                     )
                     conn.commit()
@@ -640,6 +779,7 @@ def screen_equipment():
         with st.container(border=True):
             st.subheader(r["name"])
             st.write(
+                f"카테고리: {r.get('category') or '미지정'} · "
                 f"모델: {r['model'] or '확인 필요'} · 상태: {r['condition'] or '확인 필요'} · "
                 f"하자: {r['defects'] or '확인 필요'}"
             )
@@ -650,16 +790,35 @@ def screen_equipment():
             style = st.radio(
                 "판매 글 스타일", ["짧은 글", "블로그 스타일"], horizontal=True, key=f"style_{r['id']}"
             )
-            if st.button("판매 글 생성", key=f"gen_{r['id']}"):
-                draft = generate_listing(r, style="short" if style == "짧은 글" else "blog")
-                conn.execute("UPDATE equipment SET draft=? WHERE id=?", (draft, r["id"]))
+            if st.button("판매 글 생성 (AI)", key=f"gen_{r['id']}"):
+                trade_result = run_trade(conn, r, style="short" if style == "짧은 글" else "blog")
+                conn.execute("UPDATE equipment SET draft=? WHERE id=?", (trade_result["draft"], r["id"]))
                 conn.commit()
+                st.session_state[f"trade_result_{r['id']}"] = trade_result
                 st.rerun()
 
+            trade_result = st.session_state.get(f"trade_result_{r['id']}")
+            if trade_result:
+                predicted = trade_result["predicted_price"]
+                if predicted.get("ok"):
+                    low, high = predicted["price_range"]
+                    st.info(
+                        f"🤖 AI 추천가: {predicted['predicted_price']:,}원 "
+                        f"(유사 사례 {low:,}~{high:,}원, {predicted['sample_size']}건) · {predicted['message']}"
+                    )
+                elif predicted.get("message"):
+                    st.caption(predicted["message"])
+
             if r["draft"]:
+                source_label = ""
+                if trade_result:
+                    source_label = " · AI 생성" if trade_result["draft_source"] == "llm" else " · 기본 템플릿"
                 st.text_area(
-                    "판매 글 (복사해서 사용하세요)", value=r["draft"], height=220, key=f"draft_{r['id']}"
+                    f"판매 글{source_label} (복사해서 사용하세요)",
+                    value=r["draft"], height=220, key=f"draft_{r['id']}",
                 )
+                if trade_result and trade_result.get("channel_tip"):
+                    st.markdown(trade_result["channel_tip"])
 
             c1, c2 = st.columns(2)
             with c1:
@@ -688,6 +847,98 @@ def screen_equipment():
                     conn.commit()
                     st.rerun()
 
+            if r["status"] == "처분 완료":
+                if r.get("final_price"):
+                    st.caption(f"✅ 실제 판매가 기록됨: {r['final_price']:,}원 (AI 시세 학습에 반영됨)")
+                else:
+                    final_price_input = st.text_input(
+                        "실제 판매가 (원, 다음 AI 추천가 정확도를 높이는 데 쓰여요)",
+                        key=f"final_price_{r['id']}",
+                    )
+                    if st.button("판매가 기록", key=f"record_price_{r['id']}"):
+                        if record_equipment_sale(conn, r["id"], final_price_input):
+                            st.success("기록했습니다. 다음 AI 추천가부터 이 데이터가 반영돼요.")
+                            st.rerun()
+                        else:
+                            st.warning("판매가를 해석할 수 없어요. 숫자로 입력해주세요(예: 120만원).")
+
+
+def screen_marketplace():
+    st.header("설비 매칭")
+    st.caption(
+        "폐업을 준비 중인 사장님들이 '판매 중'으로 등록한 설비를 예비 창업자가 "
+        "카테고리·지역으로 찾아볼 수 있는 화면입니다."
+    )
+
+    all_listings = get_marketplace_listings(conn)
+    categories = ["전체"] + sorted({l["category"] for l in all_listings if l.get("category")})
+    regions = ["전체"] + sorted({l["region"] for l in all_listings if l.get("region")})
+    business_options = ["선택 안 함"] + list(BUSINESS_TYPE_CATEGORIES.keys())
+
+    business_type = st.selectbox(
+        "🎯 준비 중인 업종 (고르면 관련도 높은 매물을 위로 추천해드려요)", business_options
+    )
+    c1, c2 = st.columns(2)
+    with c1:
+        category_filter = st.selectbox("카테고리", categories)
+    with c2:
+        region_filter = st.selectbox("지역", regions)
+
+    listings = get_marketplace_listings(
+        conn,
+        category=None if category_filter == "전체" else category_filter,
+        region=None if region_filter == "전체" else region_filter,
+    )
+
+    if not listings:
+        st.info("조건에 맞는 판매 중인 설비가 없습니다.")
+        return
+
+    business = None if business_type == "선택 안 함" else business_type
+    if business:
+        listings = sorted(
+            listings, key=lambda it: score_equipment_match(it, business), reverse=True
+        )
+
+    for item in listings:
+        with st.container(border=True):
+            st.subheader(item["name"])
+            st.write(
+                f"카테고리: {item.get('category') or '확인 필요'} · "
+                f"지역: {item.get('region') or '확인 필요'} · "
+                f"상태: {item.get('condition') or '확인 필요'}"
+            )
+            st.write(
+                f"희망 가격: {item.get('asking_price') or '확인 필요'} · "
+                f"수거 조건: {item.get('pickup_terms') or '확인 필요'}"
+            )
+
+            if business:
+                match_score = score_equipment_match(item, business)
+                st.progress(match_score / 100, text=f"🎯 {business} 창업 추천도 {match_score}/100")
+
+            predicted = predict_price(
+                conn, item.get("category"), item.get("used_period"), item.get("condition")
+            )
+            if predicted.get("ok") and predicted.get("predicted_price"):
+                asking_num = parse_price(item.get("asking_price"))
+                if asking_num is not None:
+                    diff_pct = round(
+                        (predicted["predicted_price"] - asking_num) / predicted["predicted_price"] * 100
+                    )
+                    if diff_pct > 0:
+                        st.markdown(f":green[🤖 AI 추정 시세 대비 약 {diff_pct}% 저렴]")
+                    elif diff_pct < 0:
+                        st.markdown(f":orange[🤖 AI 추정 시세 대비 약 {-diff_pct}% 비쌈]")
+
+            if item.get("draft"):
+                with st.expander("판매 글 보기"):
+                    st.write(item["draft"])
+
+            if st.button("관심 표시", key=f"interest_{item['id']}"):
+                record_marketplace_interest(conn, USER_ID, item["id"])
+                st.success("관심을 표시했습니다. 판매자에게 직접 연락해보세요.")
+
 
 PAGES = {
     "폐업 진행 상황": screen_dashboard,
@@ -696,6 +947,7 @@ PAGES = {
     "폐업 후": lambda: screen_stage("후", "폐업 후"),
     "지원정책": screen_policies,
     "중고품 관리": screen_equipment,
+    "설비 매칭": screen_marketplace,
 }
 
 PAGE_DESCRIPTIONS = {
@@ -705,18 +957,24 @@ PAGE_DESCRIPTIONS = {
     "폐업 후": "마무리 업무와 코칭",
     "지원정책": "받을 수 있는 지원사업 확인",
     "중고품 관리": "중고 집기 정리·판매 글",
+    "설비 매칭": "예비 창업자를 위한 폐업 설비 찾기",
 }
 
 NAV_GROUPS = [
     (None, ["폐업 진행 상황"]),
     ("단계별 코칭", ["폐업 준비", "폐업 진행", "폐업 후"]),
-    ("기타", ["지원정책", "중고품 관리"]),
+    ("기타", ["지원정책", "중고품 관리", "설비 매칭"]),
 ]
 
 if "current_page" not in st.session_state:
     st.session_state["current_page"] = "폐업 진행 상황"
 
 st.sidebar.title("다음걸음")
+st.sidebar.caption(f"👤 {USER_ID}")
+if st.sidebar.button("다른 이름으로 시작", key="logout", use_container_width=True):
+    st.session_state.clear()
+    st.rerun()
+st.sidebar.divider()
 
 for group_label, page_names in NAV_GROUPS:
     if group_label:

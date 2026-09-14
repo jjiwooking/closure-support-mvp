@@ -1,7 +1,19 @@
 import json
+import re
 from datetime import date, datetime, timedelta
 
+import pricing_model
 from bizinfo_client import fetch_bizinfo_policies
+
+_ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def validate_iso_date(value):
+    """YYYY-MM-DD 형식이 아니면 None을 반환한다(호출부가 '확인 필요'로 처리하고,
+    문자열 정렬에 의존하는 sort_policies_by_deadline이 깨지지 않게 한다)."""
+    if value and _ISO_DATE_RE.match(value):
+        return value
+    return None
 
 
 # ---------- 기록 서비스 ----------
@@ -131,44 +143,66 @@ def get_or_create_application(conn, user_task_id):
     return dict(row)
 
 
-def record_application_date(conn, user_task_id, applied_at, user_id):
+def _update_application_fields(conn, user_task_id, user_id, fields: dict):
+    """policy_applications의 일부 컬럼만 갱신하는 4개 함수(신청일/보완/심사결과/입금)가
+    공유하는 조회→UPDATE→commit→log_change 절차. fields의 키는 항상 호출부에서
+    고정된 컬럼명 리터럴만 넘기므로 f-string으로 컬럼을 넣어도 인젝션 위험이 없다."""
     app = get_or_create_application(conn, user_task_id)
+    set_clause = ", ".join(f"{col}=?" for col in fields)
     conn.execute(
-        "UPDATE policy_applications SET applied_at=?, updated_at=? WHERE user_task_id=?",
-        (applied_at, datetime.utcnow().isoformat(), user_task_id),
+        f"UPDATE policy_applications SET {set_clause}, updated_at=? WHERE user_task_id=?",
+        (*fields.values(), datetime.utcnow().isoformat(), user_task_id),
     )
     conn.commit()
-    log_change(conn, user_id, "policy_application", app["id"], app.get("applied_at"), applied_at)
+    for col, new_value in fields.items():
+        log_change(conn, user_id, "policy_application", app["id"], app.get(col), new_value)
+    return app
+
+
+def record_application_date(conn, user_task_id, applied_at, user_id):
+    _update_application_fields(conn, user_task_id, user_id, {"applied_at": applied_at})
 
 
 def record_supplement(conn, user_task_id, note, due_date, user_id):
-    app = get_or_create_application(conn, user_task_id)
+    _update_application_fields(
+        conn, user_task_id, user_id, {"supplement_note": note, "supplement_due": due_date}
+    )
+
+
+def _record_policy_outcome(conn, user_task_id, status):
+    """실제 심사 결과(승인/불승인)를 policy_outcome_history에 반영해, 다음
+    analytics.policy_approval_stats가 seed 데이터뿐 아니라 실사용 이력도 함께
+    보게 한다(심사평 '데이터분석 요소' — 모델이 실사용으로 정교해지게 함)."""
+    row = conn.execute(
+        """
+        SELECT p.title AS policy_title, p.target_career, pr.region
+        FROM user_tasks ut
+        JOIN policies p ON ut.policy_id = p.id
+        JOIN profiles pr ON pr.user_id = ut.user_id
+        WHERE ut.id = ?
+        """,
+        (user_task_id,),
+    ).fetchone()
+    if not row:
+        return  # 정책과 연결되지 않은 업무(예: 신청서 작성 안내)는 기록하지 않음
     conn.execute(
-        "UPDATE policy_applications SET supplement_note=?, supplement_due=?, updated_at=? WHERE user_task_id=?",
-        (note, due_date, datetime.utcnow().isoformat(), user_task_id),
+        """
+        INSERT INTO policy_outcome_history (policy_title, target_career, region, decision_status, decided_at)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (row["policy_title"], row["target_career"] or "공통", row["region"], status, datetime.utcnow().isoformat()),
     )
     conn.commit()
-    log_change(conn, user_id, "policy_application", app["id"], app.get("supplement_note"), note)
 
 
 def update_decision_status(conn, user_task_id, status, user_id):
-    app = get_or_create_application(conn, user_task_id)
-    conn.execute(
-        "UPDATE policy_applications SET decision_status=?, updated_at=? WHERE user_task_id=?",
-        (status, datetime.utcnow().isoformat(), user_task_id),
-    )
-    conn.commit()
-    log_change(conn, user_id, "policy_application", app["id"], app.get("decision_status"), status)
+    _update_application_fields(conn, user_task_id, user_id, {"decision_status": status})
+    if status in ("승인", "불승인"):
+        _record_policy_outcome(conn, user_task_id, status)
 
 
 def update_application_payment(conn, user_task_id, status, user_id):
-    app = get_or_create_application(conn, user_task_id)
-    conn.execute(
-        "UPDATE policy_applications SET payment_status=?, updated_at=? WHERE user_task_id=?",
-        (status, datetime.utcnow().isoformat(), user_task_id),
-    )
-    conn.commit()
-    log_change(conn, user_id, "policy_application", app["id"], app.get("payment_status"), status)
+    _update_application_fields(conn, user_task_id, user_id, {"payment_status": status})
 
 
 def register_policy_interest(conn, policy_id, user_id):
@@ -242,10 +276,8 @@ def log_research_run(conn, source_count: int):
     conn.commit()
 
 
-def find_new_policy_matches(conn, user_id, profile: dict):
-    """사람이 검토를 마친(review_status='검토완료') 정책 중, 이 사용자에게 아직
-    한 번도 매칭 알림을 보낸 적 없고, 조건(evaluate_eligibility)과 진로가 맞는
-    것만 추린다. DB에 쓰지는 않는 순수 판정 함수."""
+def get_reviewed_policies(conn):
+    """사람이 검토를 마친(review_status='검토완료') 정책만 가져온다."""
     rows = conn.execute(
         """
         SELECT p.* FROM policies p
@@ -253,7 +285,46 @@ def find_new_policy_matches(conn, user_id, profile: dict):
         WHERE s.review_status = '검토완료'
         """
     ).fetchall()
-    policies = [dict(r) for r in rows]
+    return [dict(r) for r in rows]
+
+
+def get_user_equipment(conn, user_id):
+    rows = conn.execute("SELECT * FROM equipment WHERE user_id=?", (user_id,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def record_equipment_sale(conn, equipment_id, price_text: str) -> bool:
+    """실제 판매가를 equipment.final_price에 기록하고, 같은 데이터를
+    market_price_samples에도 추가해 다음 pricing_model.predict_price(KNN)가
+    실거래가로 더 정교해지게 한다(심사평 '데이터분석 요소' 대응). 카테고리/상태가
+    비어있거나 가격을 해석할 수 없으면 학습 데이터에는 넣지 않는다(잘못된 근거를
+    만들지 않기 위함)."""
+    price = pricing_model.parse_price(price_text)
+    if price is None:
+        return False
+
+    item = conn.execute("SELECT * FROM equipment WHERE id=?", (equipment_id,)).fetchone()
+    if not item:
+        return False
+    item = dict(item)
+
+    conn.execute("UPDATE equipment SET final_price=? WHERE id=?", (price, equipment_id))
+
+    if item.get("category") and item.get("condition") in pricing_model.CONDITION_ORDER:
+        months = pricing_model.parse_used_period_months(item.get("used_period"))
+        conn.execute(
+            "INSERT INTO market_price_samples (category, used_period_months, condition, price) VALUES (?, ?, ?, ?)",
+            (item["category"], months, item["condition"], price),
+        )
+    conn.commit()
+    return True
+
+
+def find_new_policy_matches(conn, user_id, profile: dict):
+    """사람이 검토를 마친(review_status='검토완료') 정책 중, 이 사용자에게 아직
+    한 번도 매칭 알림을 보낸 적 없고, 조건(evaluate_eligibility)과 진로가 맞는
+    것만 추린다. DB에 쓰지는 않는 순수 판정 함수."""
+    policies = get_reviewed_policies(conn)
 
     already_matched = {
         row["policy_id"]
@@ -391,6 +462,31 @@ def evaluate_eligibility(profile: dict, eligibility_rules_json: str) -> str:
     if unknown:
         return "추가 정보 필요"
     return "입력 조건 부합"
+
+
+# ---------- 설비 매칭(창업자용 마켓) — 판매 중인 물품을 사용자 구분 없이 조회 ----------
+
+def get_marketplace_listings(conn, category: str = None, region: str = None):
+    """'판매 중'으로 표시된 모든 사용자의 집기를 조회한다(심사평 "창업자-폐업자
+    설비 매칭" 대응). 카테고리/지역은 선택 필터."""
+    query = "SELECT * FROM equipment WHERE status = '판매 중'"
+    params = []
+    if category:
+        query += " AND category = ?"
+        params.append(category)
+    if region:
+        query += " AND region = ?"
+        params.append(region)
+    rows = conn.execute(query, params).fetchall()
+    return [dict(r) for r in rows]
+
+
+def record_marketplace_interest(conn, buyer_user_id, equipment_id):
+    conn.execute(
+        "INSERT INTO marketplace_interests (buyer_user_id, equipment_id, created_at) VALUES (?, ?, ?)",
+        (buyer_user_id, equipment_id, datetime.utcnow().isoformat()),
+    )
+    conn.commit()
 
 
 # ---------- 집기 판매 글 생성 (입력된 사실만 사용, 미입력 항목은 "확인 필요"로 표기) ----------

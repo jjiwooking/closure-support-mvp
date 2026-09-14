@@ -19,7 +19,7 @@ from config import EMBEDDING_MODEL, LLM_API_KEY, LLM_MODEL, LLM_PROVIDER, llm_co
 GEMINI_ENDPOINT_TMPL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 GEMINI_EMBED_ENDPOINT_TMPL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:embedContent"
 
-MAX_LLM_CALLS_PER_PROCESS = 30
+MAX_LLM_CALLS_PER_PROCESS = 60
 
 _llm_call_count = 0
 

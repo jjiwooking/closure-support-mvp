@@ -25,14 +25,27 @@ def _collection():
     return _client.get_or_create_collection(name=_COLLECTION_NAME, embedding_function=None)
 
 
+class _EmbeddingFailed(Exception):
+    """lru_cache는 예외를 캐시하지 않으므로, 실패를 예외로 표현해 일시적
+    임베딩 API 오류가 영구히 캐시되는 것을 막는다."""
+
+
 @lru_cache(maxsize=256)
-def _embed_cached(text: str):
-    """반환: 임베딩 튜플 또는 실패 시 None. lru_cache가 dict/list를 못 받으므로
-    text(str) 하나만 키로 쓰고, 결과는 해시 가능하도록 tuple로 저장한다."""
+def _embed_cached_raw(text: str):
     result = generate_embedding(text)
     if not result["ok"]:
-        return None
+        raise _EmbeddingFailed()
     return tuple(result["values"])
+
+
+def _embed_cached(text: str):
+    """반환: 임베딩 튜플 또는 실패 시 None. lru_cache가 dict/list를 못 받으므로
+    text(str) 하나만 키로 쓰고, 결과는 해시 가능하도록 tuple로 저장한다.
+    실패는 캐시되지 않으므로 다음 동일 텍스트 요청 때 다시 시도한다."""
+    try:
+        return _embed_cached_raw(text)
+    except _EmbeddingFailed:
+        return None
 
 
 def retrieve(question: str, items: list[dict], top_k: int = 3):

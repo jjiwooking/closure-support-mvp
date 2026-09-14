@@ -49,11 +49,13 @@ def _task_block_text(task, docs):
     )
 
 
+class _LLMCallFailed(Exception):
+    """lru_cache는 반환값만 캐시하고 예외는 캐시하지 않으므로, 실패를 예외로
+    표현해 일시적 API 오류가 영구히 캐시되는 것을 막는다."""
+
+
 @functools.lru_cache(maxsize=128)
-def _web_search_answer(question: str):
-    """등록된 근거가 없을 때만 쓰는 보조 수단. 검토되지 않은 실시간 검색
-    결과이므로 항상 미확인 표시와 출처 링크를 붙인다. 실패하면 None.
-    동일 질문 재요청은 캐시로 처리되어 API를 다시 부르지 않는다."""
+def _web_search_answer_cached(question: str):
     system_instruction = (
         "당신은 한국 소상공인의 폐업 절차를 돕는 검색 도우미입니다. "
         "정부24, 국세청, 서울시, 기업마당 등 공식 정부/지자체 사이트 정보를 우선해서 찾으세요. "
@@ -63,7 +65,7 @@ def _web_search_answer(question: str):
     prompt = f"다음 질문에 대해 한국 공식 정부 사이트를 검색해서 답해주세요: {question}"
     result = generate_text_with_search(prompt, system_instruction=system_instruction)
     if not (result["ok"] and result["text"]):
-        return None
+        raise _LLMCallFailed()
 
     text = result["text"].strip()
     if result["citations"]:
@@ -72,11 +74,19 @@ def _web_search_answer(question: str):
     return text
 
 
+def _web_search_answer(question: str):
+    """등록된 근거가 없을 때만 쓰는 보조 수단. 검토되지 않은 실시간 검색
+    결과이므로 항상 미확인 표시와 출처 링크를 붙인다. 실패하면 None(실패는
+    캐시되지 않으므로 다음 동일 질문 때 다시 시도한다). 성공한 동일 질문
+    재요청은 캐시로 처리되어 API를 다시 부르지 않는다."""
+    try:
+        return _web_search_answer_cached(question)
+    except _LLMCallFailed:
+        return None
+
+
 @functools.lru_cache(maxsize=128)
-def _llm_explain(question: str, grounding_context: str):
-    """질문과 관련된 근거를 이미 추려서 받아 그 내용 위주로 답하도록 LLM에
-    요청한다. 실패하면 None을 반환해 근거 텍스트 그대로 폴백하게 한다.
-    동일한 (질문, 근거) 조합은 캐시되어 재호출하지 않는다."""
+def _llm_explain_cached(question: str, grounding_context: str):
     system_instruction = (
         "당신은 폐업을 준비하는 소상공인을 돕는 코칭 챗봇입니다. "
         "아래 '근거 정보'에는 이 단계에 속한 업무의 사실이 정리돼 있습니다. "
@@ -93,7 +103,18 @@ def _llm_explain(question: str, grounding_context: str):
     result = generate_text(prompt, system_instruction=system_instruction)
     if result["ok"] and result["text"]:
         return result["text"].strip()
-    return None
+    raise _LLMCallFailed()
+
+
+def _llm_explain(question: str, grounding_context: str):
+    """질문과 관련된 근거를 이미 추려서 받아 그 내용 위주로 답하도록 LLM에
+    요청한다. 실패하면 None을 반환해 근거 텍스트 그대로 폴백하게 한다(실패는
+    캐시되지 않으므로 다음 동일 (질문, 근거) 요청 때 다시 시도한다). 성공한
+    동일 (질문, 근거) 조합은 캐시되어 재호출하지 않는다."""
+    try:
+        return _llm_explain_cached(question, grounding_context)
+    except _LLMCallFailed:
+        return None
 
 
 def guide_search(state: GuideState) -> dict:

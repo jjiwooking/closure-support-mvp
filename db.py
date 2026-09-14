@@ -25,7 +25,8 @@ CREATE TABLE IF NOT EXISTS sources (
     retrieved_at TEXT,
     reviewed_at TEXT,
     version TEXT,
-    review_status TEXT
+    review_status TEXT,
+    extracted_draft TEXT
 );
 
 CREATE TABLE IF NOT EXISTS policies (
@@ -100,7 +101,10 @@ CREATE TABLE IF NOT EXISTS equipment (
     pickup_terms TEXT,
     draft TEXT,
     status TEXT DEFAULT '보관 중',
-    payment_status TEXT DEFAULT '미입금'
+    payment_status TEXT DEFAULT '미입금',
+    category TEXT,
+    region TEXT,
+    final_price INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS change_logs (
@@ -150,6 +154,31 @@ CREATE TABLE IF NOT EXISTS notifications (
     read_at TEXT,
     FOREIGN KEY(policy_id) REFERENCES policies(id)
 );
+
+CREATE TABLE IF NOT EXISTS market_price_samples (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    category TEXT NOT NULL,
+    used_period_months INTEGER,
+    condition TEXT,
+    price INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS policy_outcome_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    policy_title TEXT,
+    target_career TEXT,
+    region TEXT,
+    decision_status TEXT,
+    decided_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS marketplace_interests (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    buyer_user_id TEXT NOT NULL,
+    equipment_id INTEGER NOT NULL,
+    created_at TEXT,
+    FOREIGN KEY(equipment_id) REFERENCES equipment(id)
+);
 """
 
 
@@ -185,4 +214,20 @@ def _migrate(conn):
         conn.commit()
     if "application_deadline" not in policy_cols:
         conn.execute("ALTER TABLE policies ADD COLUMN application_deadline TEXT")
+        conn.commit()
+
+    equipment_cols = [row["name"] for row in conn.execute("PRAGMA table_info(equipment)")]
+    if "category" not in equipment_cols:
+        conn.execute("ALTER TABLE equipment ADD COLUMN category TEXT")
+        conn.commit()
+    if "region" not in equipment_cols:
+        conn.execute("ALTER TABLE equipment ADD COLUMN region TEXT")
+        conn.commit()
+    if "final_price" not in equipment_cols:
+        conn.execute("ALTER TABLE equipment ADD COLUMN final_price INTEGER")
+        conn.commit()
+
+    source_cols = [row["name"] for row in conn.execute("PRAGMA table_info(sources)")]
+    if "extracted_draft" not in source_cols:
+        conn.execute("ALTER TABLE sources ADD COLUMN extracted_draft TEXT")
         conn.commit()

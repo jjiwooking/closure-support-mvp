@@ -1,3 +1,4 @@
 streamlit>=1.38
 langgraph>=1.2
 chromadb>=1.5
+scikit-learn>=1.5
