@@ -6,7 +6,7 @@ services.evaluate_eligibility()의 4단계 라벨(입력 조건 부합/추가 �
 0~100 점수와 과거 데이터 기반 승인율 통계를 더해 사용자가 우선순위를
 가늠할 수 있게 돕는다. 두 함수 모두 LLM을 호출하지 않는다.
 """
-import json
+from services import parse_eligibility_rules
 
 # 필드별 감점/가점 가중치. eligibility_rules에 걸린 조건 하나하나를 같은 비중으로
 # 보지 않기 위함 — region/rent_status처럼 자주 등장하는 필드는 기본 가중치,
@@ -18,11 +18,7 @@ UNKNOWN_PENALTY_RATIO = 0.4  # 불일치보다는 약하게 감점(아직 모르
 
 def score_policy_fit(profile: dict, eligibility_rules_json: str) -> int:
     """조건 충족도를 0~100 점수로 환산한다. 규칙이 없으면 50점(중립, 확인 필요)."""
-    try:
-        rules = json.loads(eligibility_rules_json) if eligibility_rules_json else {}
-    except (json.JSONDecodeError, TypeError):
-        rules = {}
-
+    rules = parse_eligibility_rules(eligibility_rules_json)
     if not rules:
         return 50
 

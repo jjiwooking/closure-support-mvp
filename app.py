@@ -5,7 +5,7 @@ import streamlit as st
 
 from analytics import BUSINESS_TYPE_CATEGORIES, policy_approval_stats, score_equipment_match, score_policy_fit
 from db import get_connection, init_db
-from pricing_model import parse_price, predict_price
+from pricing_model import fetch_samples, parse_price, predict_price
 from research_graph import run_research
 from seed import seed_if_empty
 from supervisor_graph import run_supervisor
@@ -39,7 +39,6 @@ from services import (
 )
 from trade_graph import run_trade
 
-USER_ID = None  # 로그인 후 아래에서 세션별로 채워짐(더 이상 전역 고정값이 아님)
 EQUIPMENT_CATEGORIES = ["주방/조리기기", "냉장/냉동", "카페/음료기기", "집기/가구", "전자기기", "기타"]
 CONDITION_OPTIONS = ["상", "중", "하"]
 
@@ -121,10 +120,10 @@ conn = _get_app_connection()
 
 
 def _login_screen():
-    """비밀번호 없는 이름 기반 '로그인'. 심사평 이후 발견된 위험(전역 USER_ID
-    하나를 모든 접속자가 공유해 데이터가 서로 섞이는 문제)을 없애기 위한
-    최소 구현 — 해커톤 데모 범위에 맞춰 이름만으로 구분하고, 같은 이름으로
-    다시 오면 이전 기록을 그대로 이어서 보여준다."""
+    """비밀번호 없는 이름 기반 '로그인'. 심사평 이후 발견된 위험(모든 접속자가
+    데이터를 공유하는 문제)을 없애기 위한 최소 구현 — 해커톤 데모 범위에 맞춰
+    이름만으로 구분하고, 같은 이름으로 다시 오면 이전 기록을 그대로 이어서
+    보여준다."""
     st.title("다음걸음")
     st.write(
         "상호명 또는 닉네임을 입력하고 시작하세요. 비밀번호는 없으며, "
@@ -146,12 +145,23 @@ if "user_id" not in st.session_state:
     _login_screen()
     st.stop()
 
-USER_ID = st.session_state["user_id"]
-seed_if_empty(conn, USER_ID)
+
+def current_user_id():
+    """st.session_state에서 매번 새로 읽는다. Streamlit은 세션마다 별도
+    프로세스가 아니라 같은 프로세스 안에서 스크립트를 재실행하므로, 이 값을
+    한 번 읽어 모듈 전역변수에 담아두면(예전 방식처럼) 동시 접속 시
+    한 세션의 재실행이 그 전역변수를 바꾸는 순간 다른 세션이 실행 중이던
+    코드가 그 값을 읽어가는 경쟁 상태가 생긴다. st.session_state는 내부적으로
+    현재 실행 중인 세션에 자동으로 바인딩되므로, 매 호출마다 여기서 새로
+    읽어야 세션 간 데이터가 섞이지 않는다."""
+    return st.session_state["user_id"]
+
+
+seed_if_empty(conn, current_user_id())
 
 
 def get_profile():
-    row = conn.execute("SELECT * FROM profiles WHERE user_id=?", (USER_ID,)).fetchone()
+    row = conn.execute("SELECT * FROM profiles WHERE user_id=?", (current_user_id(),)).fetchone()
     return dict(row) if row else {}
 
 
@@ -164,7 +174,7 @@ def get_tasks(stage=None):
         JOIN task_templates tt ON ut.template_id = tt.id
         WHERE ut.user_id = ?
     """
-    params = [USER_ID]
+    params = [current_user_id()]
     if stage:
         query += " AND tt.stage = ?"
         params.append(stage)
@@ -242,7 +252,7 @@ def render_profile_editor():
                 c1, c2 = st.columns(2)
                 with c1:
                     if st.button("변경 확정", key="confirm_profile_change"):
-                        update_profile(conn, USER_ID, pending)
+                        update_profile(conn, current_user_id(), pending)
                         del st.session_state["pending_profile_change"]
                         st.success("반영되었습니다. 사용자 예정일 기준 업무의 기한이 재계산되었습니다.")
                         st.rerun()
@@ -286,7 +296,7 @@ def render_stage_checklist(all_tasks):
                         st.caption(f"기한: {t.get('due_date') or '미정'}")
                 if new_checked != checked:
                     new_status = "사용자 완료" if new_checked else "진행 중"
-                    update_task_status(conn, t["id"], new_status, USER_ID)
+                    update_task_status(conn, t["id"], new_status, current_user_id())
                     if new_status == "사용자 완료":
                         updated_stage_tasks = [
                             {**x, "status": new_status} if x["id"] == t["id"] else x
@@ -317,7 +327,7 @@ def render_stage_transition_banner():
     else:
         st.success(f"'{STAGE_LABELS[from_key]}' 단계를 모두 완료했어요! 모든 단계를 마쳤습니다.")
 
-    if from_key == "준비" and should_suggest_trade(conn, USER_ID):
+    if from_key == "준비" and should_suggest_trade(conn, current_user_id()):
         st.info("정리할 집기가 있다면 지금 중고거래를 준비해보세요.")
         if st.button("중고품 관리로 이동", key="goto_equipment_from_banner"):
             st.session_state["current_page"] = "중고품 관리"
@@ -326,7 +336,7 @@ def render_stage_transition_banner():
 
 def render_notifications():
     """백그라운드 정책리서치가 찾아낸, 아직 읽지 않은 맞춤 알림을 보여준다."""
-    for n in get_unread_notifications(conn, USER_ID):
+    for n in get_unread_notifications(conn, current_user_id()):
         c1, c2 = st.columns([5, 1])
         with c1:
             st.info(n["message"])
@@ -387,7 +397,7 @@ def _answer_stage_context(stage_key, tasks, question_text):
     '그거 얼마야?' 같은 대명사 후속 질문도 거래상담 에이전트가 이어받을 수 있게 한다."""
     focus_key = f"chat_focus_{stage_key}"
     focus = st.session_state.get(focus_key) or {}
-    response = run_supervisor(conn, tasks, question_text, USER_ID, get_profile(), focus=focus)
+    response = run_supervisor(conn, tasks, question_text, current_user_id(), get_profile(), focus=focus)
     st.session_state[focus_key] = response.get("focus") or {}
     text = response["answer"]
     source_type = response.get("source_type", "none")
@@ -476,7 +486,7 @@ def render_task_core(task):
                     "준비 완료", value=bool(d["user_checked"]), key=f"doc_{d['id']}"
                 )
                 if checked != bool(d["user_checked"]):
-                    toggle_document_check(conn, d["id"], checked, USER_ID)
+                    toggle_document_check(conn, d["id"], checked, current_user_id())
                     st.rerun()
 
     st.link_button(
@@ -490,15 +500,15 @@ def render_task_core(task):
     c1, c2, c3 = st.columns(3)
     with c1:
         if st.button("신청 완료로 기록", key=f"done_{task['id']}"):
-            update_task_status(conn, task["id"], "사용자 완료", USER_ID)
+            update_task_status(conn, task["id"], "사용자 완료", current_user_id())
             st.rerun()
     with c2:
         if st.button("완료 취소", key=f"undo_{task['id']}"):
-            update_task_status(conn, task["id"], "진행 중", USER_ID)
+            update_task_status(conn, task["id"], "진행 중", current_user_id())
             st.rerun()
     with c3:
         if st.button("확인 필요로 표시", key=f"flag_{task['id']}"):
-            update_task_status(conn, task["id"], "확인 필요", USER_ID)
+            update_task_status(conn, task["id"], "확인 필요", current_user_id())
             st.rerun()
 
     if task.get("policy_id"):
@@ -520,7 +530,7 @@ def render_task_core(task):
             )
             applied_date = st.date_input("신청일", value=applied_default, key=f"applied_{task['id']}")
             if st.button("신청일로 기록", key=f"apply_btn_{task['id']}"):
-                record_application_date(conn, task["id"], applied_date.isoformat(), USER_ID)
+                record_application_date(conn, task["id"], applied_date.isoformat(), current_user_id())
                 st.rerun()
             st.caption(f"현재 기록: {application.get('applied_at') or '아직 신청 기록 없음'}")
         with c2:
@@ -532,7 +542,7 @@ def render_task_core(task):
                 key=f"decision_{task['id']}",
             )
             if new_decision != application["decision_status"]:
-                update_decision_status(conn, task["id"], new_decision, USER_ID)
+                update_decision_status(conn, task["id"], new_decision, current_user_id())
                 st.rerun()
 
             payment_options = ["미입금", "입금 완료"]
@@ -543,7 +553,7 @@ def render_task_core(task):
                 key=f"app_payment_{task['id']}",
             )
             if new_payment != application["payment_status"]:
-                update_application_payment(conn, task["id"], new_payment, USER_ID)
+                update_application_payment(conn, task["id"], new_payment, current_user_id())
                 st.rerun()
 
         st.write("**보완 요청 대응**")
@@ -559,7 +569,7 @@ def render_task_core(task):
             key=f"supp_due_{task['id']}",
         )
         if st.button("보완 내용 저장", key=f"supp_save_{task['id']}"):
-            record_supplement(conn, task["id"], note, due, USER_ID)
+            record_supplement(conn, task["id"], note, due, current_user_id())
             st.rerun()
 
 
@@ -598,7 +608,7 @@ def screen_policies():
             "이미 검토완료된 정책 중 조건에 맞는 게 있으면 대시보드에 알림이 생깁니다."
         )
         if st.button("지금 리서치 실행"):
-            result = run_research(conn, USER_ID, profile)
+            result = run_research(conn, current_user_id(), profile)
             st.success(
                 f"🤖 정책수집 에이전트: {result['source_count']}건 수집 → "
                 f"정책구조화 에이전트: {result['extracted_count']}건 AI 초안 작성 → "
@@ -667,7 +677,7 @@ def screen_policies():
         index=career_options.index(current_career) if current_career in career_options else 0,
     )
     if new_career != current_career:
-        update_career_path(conn, USER_ID, new_career)
+        update_career_path(conn, current_user_id(), new_career)
         st.rerun()
 
     approval = policy_approval_stats(conn, current_career)
@@ -695,7 +705,7 @@ def screen_policies():
     registered_policy_ids = {
         row["policy_id"]
         for row in conn.execute(
-            "SELECT policy_id FROM user_tasks WHERE user_id=? AND policy_id IS NOT NULL", (USER_ID,)
+            "SELECT policy_id FROM user_tasks WHERE user_id=? AND policy_id IS NOT NULL", (current_user_id(),)
         ).fetchall()
     }
 
@@ -720,7 +730,7 @@ def screen_policies():
             if r["id"] in registered_policy_ids:
                 st.caption("관심 사업으로 등록됨 — '폐업 준비'/'폐업 진행' 화면에서 진행 상황을 기록하세요.")
             elif st.button("관심 사업으로 등록", key=f"interest_{r['id']}"):
-                _, created = register_policy_interest(conn, r["id"], USER_ID)
+                _, created = register_policy_interest(conn, r["id"], current_user_id())
                 if created:
                     st.success("등록되었습니다. '폐업 진행' 화면에서 진행 상황을 기록하세요.")
                     st.rerun()
@@ -757,7 +767,7 @@ def screen_equipment():
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
-                            USER_ID, name, model, used_period, condition, defects,
+                            current_user_id(), name, model, used_period, condition, defects,
                             ownership_status, asking_price, pickup_terms, "", "보관 중", "미입금",
                             category, region,
                         ),
@@ -766,7 +776,7 @@ def screen_equipment():
                     st.success("등록되었습니다.")
                     st.rerun()
 
-    rows = conn.execute("SELECT * FROM equipment WHERE user_id=?", (USER_ID,)).fetchall()
+    rows = conn.execute("SELECT * FROM equipment WHERE user_id=?", (current_user_id(),)).fetchall()
     if not rows:
         st.info("등록된 물품이 없습니다.")
         return
@@ -829,7 +839,7 @@ def screen_equipment():
                     key=f"status_{r['id']}",
                 )
                 if new_status != r["status"]:
-                    log_change(conn, USER_ID, "equipment", r["id"], r["status"], new_status)
+                    log_change(conn, current_user_id(), "equipment", r["id"], r["status"], new_status)
                     conn.execute("UPDATE equipment SET status=? WHERE id=?", (new_status, r["id"]))
                     conn.commit()
                     st.rerun()
@@ -900,6 +910,9 @@ def screen_marketplace():
             listings, key=lambda it: score_equipment_match(it, business), reverse=True
         )
 
+    # 같은 카테고리 매물이 여러 건이면 시세 샘플을 매물마다 다시 조회하지 않고
+    # 카테고리당 한 번만 가져와 재사용한다(N+1 쿼리 방지).
+    samples_by_category = {}
     for item in listings:
         with st.container(border=True):
             st.subheader(item["name"])
@@ -917,10 +930,14 @@ def screen_marketplace():
                 match_score = score_equipment_match(item, business)
                 st.progress(match_score / 100, text=f"🎯 {business} 창업 추천도 {match_score}/100")
 
+            item_category = item.get("category")
+            if item_category and item_category not in samples_by_category:
+                samples_by_category[item_category] = fetch_samples(conn, item_category)
             predicted = predict_price(
-                conn, item.get("category"), item.get("used_period"), item.get("condition")
+                conn, item_category, item.get("used_period"), item.get("condition"),
+                samples=samples_by_category.get(item_category),
             )
-            if predicted.get("ok") and predicted.get("predicted_price"):
+            if predicted.get("ok") and predicted.get("predicted_price") is not None:
                 asking_num = parse_price(item.get("asking_price"))
                 if asking_num is not None:
                     diff_pct = round(
@@ -936,7 +953,7 @@ def screen_marketplace():
                     st.write(item["draft"])
 
             if st.button("관심 표시", key=f"interest_{item['id']}"):
-                record_marketplace_interest(conn, USER_ID, item["id"])
+                record_marketplace_interest(conn, current_user_id(), item["id"])
                 st.success("관심을 표시했습니다. 판매자에게 직접 연락해보세요.")
 
 
@@ -970,7 +987,7 @@ if "current_page" not in st.session_state:
     st.session_state["current_page"] = "폐업 진행 상황"
 
 st.sidebar.title("다음걸음")
-st.sidebar.caption(f"👤 {USER_ID}")
+st.sidebar.caption(f"👤 {current_user_id()}")
 if st.sidebar.button("다른 이름으로 시작", key="logout", use_container_width=True):
     st.session_state.clear()
     st.rerun()

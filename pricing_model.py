@@ -44,7 +44,10 @@ def parse_price(text: str):
     return int(num.group(1)) if num else None
 
 
-def _fetch_samples(conn, category: str):
+def fetch_samples(conn, category: str):
+    """카테고리별 시세 샘플을 조회한다. 화면에서 같은 카테고리 매물을 여러
+    건 렌더링할 때 매물마다 다시 조회하지 않도록, 미리 한 번 불러
+    predict_price(samples=...)로 재사용할 수 있게 공개 함수로 둔다."""
     rows = conn.execute(
         "SELECT used_period_months, condition, price FROM market_price_samples WHERE category=?",
         (category,),
@@ -52,16 +55,19 @@ def _fetch_samples(conn, category: str):
     return [dict(r) for r in rows]
 
 
-def predict_price(conn, category: str, used_period_text: str, condition: str) -> dict:
+def predict_price(conn, category: str, used_period_text: str, condition: str, samples: list = None) -> dict:
     """반환: {"ok", "predicted_price", "price_range": (low, high) | None,
-    "sample_size", "message"}"""
+    "sample_size", "message"}. samples를 넘기면 DB 조회를 건너뛰고 그대로
+    쓴다(같은 카테고리를 여러 번 조회하는 N+1을 피하기 위함); 넘기지 않으면
+    기존처럼 이 함수가 직접 조회한다."""
     if not category:
         return {
             "ok": False, "predicted_price": None, "price_range": None,
             "sample_size": 0, "message": "카테고리를 선택하면 AI 추천가를 볼 수 있어요.",
         }
 
-    samples = _fetch_samples(conn, category)
+    if samples is None:
+        samples = fetch_samples(conn, category)
     if not samples:
         return {
             "ok": False, "predicted_price": None, "price_range": None,

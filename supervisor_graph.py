@@ -11,15 +11,15 @@
    하나의 답으로 합성한다(복합 질문 처리).
 
 노드 흐름:
-  route_question   : 키워드 휴리스틱(항상 동작, 여러 카테고리에 동시에 걸리면 복합
-                      질문으로 표시) + 아무 키워드도 안 걸리면 LLM 보완. 실패 시
-                      guide로 폴백(가장 안전한 기본값).
-  dispatch_guide/policy/trade : 단일 도메인 질문을 해당 전문 에이전트(_run_*)로
-                      위임한다.
-  dispatch_compound : 복합 질문이면 관련된 _run_* 함수들을 순서대로 호출해 결과를
-                      모은다.
-  synthesize        : agent_results가 1건이면 그대로 통과, 여러 건이면 LLM으로
-                      하나의 답으로 합성(미설정/실패 시 에이전트별 섹션으로 이어붙임).
+  route_question : 키워드 휴리스틱(항상 동작, 여러 카테고리에 동시에 걸리면 복합
+                    질문으로 표시) + 아무 키워드도 안 걸리면 LLM 보완. 실패 시
+                    guide로 폴백(가장 안전한 기본값).
+  dispatch       : state["routes"]에 담긴 도메인(1개든 여러 개든)마다 해당
+                    전문 에이전트(_run_*)를 순서대로 호출해 결과를 모은다 —
+                    단일/복합 질문을 별도 노드로 나누지 않고 이 노드 하나로
+                    처리한다.
+  synthesize     : agent_results가 1건이면 그대로 통과, 여러 건이면 LLM으로
+                    하나의 답으로 합성(미설정/실패 시 에이전트별 섹션으로 이어붙임).
 """
 import re
 from typing import Any, TypedDict
@@ -102,10 +102,6 @@ def route_question(state: SupervisorState) -> dict:
             return {"routes": llm_hits, "route_reason": reason}
 
     return {"routes": ["guide"], "route_reason": "기본값"}
-
-
-def _pick_destination(state: SupervisorState) -> str:
-    return "dispatch_compound" if len(state["routes"]) > 1 else f"dispatch_{state['routes'][0]}"
 
 
 # ---------- 전문 에이전트 본체 (단일/복합 경로 공용) ----------
@@ -268,14 +264,6 @@ _RUNNERS = {"guide": _run_guide, "policy": _run_policy, "trade": _run_trade}
 
 # ---------- 그래프 노드 ----------
 
-def dispatch_guide(state: SupervisorState) -> dict:
-    return {"agent_results": [_run_guide(state)]}
-
-
-def dispatch_policy(state: SupervisorState) -> dict:
-    return {"agent_results": [_run_policy(state)]}
-
-
 def _collect_focus(results: list) -> dict:
     """_run_trade가 물품을 확실히 특정했을 때만 focus를 갱신한다(_focus_equipment_id
     키 존재 여부로 판단). 특정 실패(되묻기) 시에는 이전 focus를 그대로 둔다."""
@@ -285,16 +273,11 @@ def _collect_focus(results: list) -> dict:
     return {}
 
 
-def dispatch_trade(state: SupervisorState) -> dict:
-    result = _run_trade(state)
-    update = {"agent_results": [result]}
-    focus = _collect_focus([result])
-    if focus:
-        update["focus"] = focus
-    return update
-
-
-def dispatch_compound(state: SupervisorState) -> dict:
+def dispatch(state: SupervisorState) -> dict:
+    """단일 도메인이든(routes 1개) 복합 질문이든(routes 여러 개) 이 노드
+    하나로 처리한다 — 예전엔 dispatch_guide/policy/trade/compound 4개가
+    거의 같은 패턴(_RUNNERS 호출 후 agent_results로 감싸기)을 중복해서
+    구현했었다."""
     results = [_RUNNERS[route](state) for route in state["routes"]]
     update = {"agent_results": results}
     focus = _collect_focus(results)
@@ -335,19 +318,27 @@ def synthesize(state: SupervisorState) -> dict:
     combined_agent_name = " + ".join(r["agent_name"] for r in results)
     merged_source_ids, merged_actions = [], []
     any_local = False
+    any_web_search = False
     for r in results:
         merged_source_ids.extend(r.get("source_ids") or [])
         merged_actions.extend(r.get("actions") or [])
         if r.get("source_type") == "local":
             any_local = True
+        elif r.get("source_type") == "web_search":
+            any_web_search = True
 
     combined = _llm_synthesize(state["question"], results) if llm_configured() else None
     if not combined:
         combined = "\n\n".join(f"**[{r['agent_name']}]**\n{r['answer']}" for r in results)
 
+    # 일부만 웹검색(미검증)으로 답했어도 "local"로 합쳐버리면 화면에서 미검토
+    # 경고가 사라진다. 하나라도 웹검색이 섞였으면 전체를 web_search로 표시해
+    # app.py가 반드시 미검증 안내를 붙이게 한다(local 판정보다 우선).
+    merged_source_type = "web_search" if any_web_search else ("local" if any_local else results[0]["source_type"])
+
     return {
         "answer": combined, "agent_name": combined_agent_name,
-        "source_type": "local" if any_local else results[0]["source_type"],
+        "source_type": merged_source_type,
         "source_ids": merged_source_ids, "actions": merged_actions,
     }
 
@@ -355,26 +346,11 @@ def synthesize(state: SupervisorState) -> dict:
 def _build_graph():
     workflow = StateGraph(SupervisorState)
     workflow.add_node("route_question", route_question)
-    workflow.add_node("dispatch_guide", dispatch_guide)
-    workflow.add_node("dispatch_policy", dispatch_policy)
-    workflow.add_node("dispatch_trade", dispatch_trade)
-    workflow.add_node("dispatch_compound", dispatch_compound)
+    workflow.add_node("dispatch", dispatch)
     workflow.add_node("synthesize", synthesize)
     workflow.add_edge(START, "route_question")
-    workflow.add_conditional_edges(
-        "route_question",
-        _pick_destination,
-        {
-            "dispatch_guide": "dispatch_guide",
-            "dispatch_policy": "dispatch_policy",
-            "dispatch_trade": "dispatch_trade",
-            "dispatch_compound": "dispatch_compound",
-        },
-    )
-    workflow.add_edge("dispatch_guide", "synthesize")
-    workflow.add_edge("dispatch_policy", "synthesize")
-    workflow.add_edge("dispatch_trade", "synthesize")
-    workflow.add_edge("dispatch_compound", "synthesize")
+    workflow.add_edge("route_question", "dispatch")
+    workflow.add_edge("dispatch", "synthesize")
     workflow.add_edge("synthesize", END)
     return workflow.compile()
 

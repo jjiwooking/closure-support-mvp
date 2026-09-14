@@ -169,7 +169,8 @@ CREATE TABLE IF NOT EXISTS policy_outcome_history (
     target_career TEXT,
     region TEXT,
     decision_status TEXT,
-    decided_at TEXT
+    decided_at TEXT,
+    user_task_id INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS marketplace_interests (
@@ -230,4 +231,9 @@ def _migrate(conn):
     source_cols = [row["name"] for row in conn.execute("PRAGMA table_info(sources)")]
     if "extracted_draft" not in source_cols:
         conn.execute("ALTER TABLE sources ADD COLUMN extracted_draft TEXT")
+        conn.commit()
+
+    outcome_cols = [row["name"] for row in conn.execute("PRAGMA table_info(policy_outcome_history)")]
+    if "user_task_id" not in outcome_cols:
+        conn.execute("ALTER TABLE policy_outcome_history ADD COLUMN user_task_id INTEGER")
         conn.commit()

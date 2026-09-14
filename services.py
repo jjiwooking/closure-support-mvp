@@ -16,6 +16,17 @@ def validate_iso_date(value):
     return None
 
 
+def parse_eligibility_rules(eligibility_rules_json) -> dict:
+    """policies.eligibility_rules JSON 문자열을 dict로 안전하게 파싱한다.
+    비어있거나 손상된 값이면 빈 dict를 반환한다. evaluate_eligibility와
+    analytics.score_policy_fit이 이 파싱 규칙을 공유해, 한쪽만 고치고 다른
+    쪽을 놓쳐 판정이 어긋나는 일을 막는다."""
+    try:
+        return json.loads(eligibility_rules_json) if eligibility_rules_json else {}
+    except (json.JSONDecodeError, TypeError):
+        return {}
+
+
 # ---------- 기록 서비스 ----------
 
 def log_change(conn, user_id, entity_type, entity_id, before_value, after_value):
@@ -172,7 +183,10 @@ def record_supplement(conn, user_task_id, note, due_date, user_id):
 def _record_policy_outcome(conn, user_task_id, status):
     """실제 심사 결과(승인/불승인)를 policy_outcome_history에 반영해, 다음
     analytics.policy_approval_stats가 seed 데이터뿐 아니라 실사용 이력도 함께
-    보게 한다(심사평 '데이터분석 요소' — 모델이 실사용으로 정교해지게 함)."""
+    보게 한다(심사평 '데이터분석 요소' — 모델이 실사용으로 정교해지게 함).
+    같은 user_task_id에 이미 기록이 있으면(사용자가 승인↔불승인을 정정한
+    경우) 새로 INSERT하지 않고 그 행을 UPDATE한다 — 그렇지 않으면 정정할
+    때마다 이력이 중복 적재돼 승인율 통계가 왜곡된다."""
     row = conn.execute(
         """
         SELECT p.title AS policy_title, p.target_career, pr.region
@@ -185,13 +199,25 @@ def _record_policy_outcome(conn, user_task_id, status):
     ).fetchone()
     if not row:
         return  # 정책과 연결되지 않은 업무(예: 신청서 작성 안내)는 기록하지 않음
-    conn.execute(
-        """
-        INSERT INTO policy_outcome_history (policy_title, target_career, region, decision_status, decided_at)
-        VALUES (?, ?, ?, ?, ?)
-        """,
-        (row["policy_title"], row["target_career"] or "공통", row["region"], status, datetime.utcnow().isoformat()),
-    )
+
+    now = datetime.utcnow().isoformat()
+    existing = conn.execute(
+        "SELECT id FROM policy_outcome_history WHERE user_task_id=?", (user_task_id,)
+    ).fetchone()
+    if existing:
+        conn.execute(
+            "UPDATE policy_outcome_history SET decision_status=?, decided_at=? WHERE id=?",
+            (status, now, existing["id"]),
+        )
+    else:
+        conn.execute(
+            """
+            INSERT INTO policy_outcome_history
+                (policy_title, target_career, region, decision_status, decided_at, user_task_id)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (row["policy_title"], row["target_career"] or "공통", row["region"], status, now, user_task_id),
+        )
     conn.commit()
 
 
@@ -440,11 +466,7 @@ def sort_policies_by_deadline(policies):
 
 def evaluate_eligibility(profile: dict, eligibility_rules_json: str) -> str:
     """정책 조건과 프로필을 비교해 4가지 상태 라벨 중 하나를 반환한다. LLM을 호출하지 않는다."""
-    try:
-        rules = json.loads(eligibility_rules_json) if eligibility_rules_json else {}
-    except (json.JSONDecodeError, TypeError):
-        return "모집 상태 확인 필요"
-
+    rules = parse_eligibility_rules(eligibility_rules_json)
     if not rules:
         return "모집 상태 확인 필요"
 
