@@ -1,11 +1,11 @@
-import sqlite3
-from pathlib import Path
+import psycopg2
+import psycopg2.extras
 
-DB_PATH = Path(__file__).parent / "closure_support.db"
+from config import DATABASE_URL
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS profiles (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id SERIAL PRIMARY KEY,
     user_id TEXT NOT NULL,
     region TEXT,
     planned_close_date TEXT,
@@ -18,7 +18,7 @@ CREATE TABLE IF NOT EXISTS profiles (
 );
 
 CREATE TABLE IF NOT EXISTS sources (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id SERIAL PRIMARY KEY,
     agency TEXT,
     title TEXT,
     url TEXT,
@@ -30,7 +30,7 @@ CREATE TABLE IF NOT EXISTS sources (
 );
 
 CREATE TABLE IF NOT EXISTS policies (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id SERIAL PRIMARY KEY,
     source_id INTEGER,
     title TEXT,
     period TEXT,
@@ -43,7 +43,7 @@ CREATE TABLE IF NOT EXISTS policies (
 );
 
 CREATE TABLE IF NOT EXISTS task_templates (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id SERIAL PRIMARY KEY,
     stage TEXT,
     title TEXT,
     applicability_rules TEXT,
@@ -55,7 +55,7 @@ CREATE TABLE IF NOT EXISTS task_templates (
 );
 
 CREATE TABLE IF NOT EXISTS document_guides (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id SERIAL PRIMARY KEY,
     source_id INTEGER,
     name TEXT,
     issuance_link_id TEXT,
@@ -65,7 +65,7 @@ CREATE TABLE IF NOT EXISTS document_guides (
 );
 
 CREATE TABLE IF NOT EXISTS user_tasks (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id SERIAL PRIMARY KEY,
     user_id TEXT NOT NULL,
     template_id INTEGER,
     policy_id INTEGER,
@@ -79,7 +79,7 @@ CREATE TABLE IF NOT EXISTS user_tasks (
 );
 
 CREATE TABLE IF NOT EXISTS document_checks (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id SERIAL PRIMARY KEY,
     user_task_id INTEGER,
     document_guide_id INTEGER,
     user_checked INTEGER DEFAULT 0,
@@ -89,7 +89,7 @@ CREATE TABLE IF NOT EXISTS document_checks (
 );
 
 CREATE TABLE IF NOT EXISTS equipment (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id SERIAL PRIMARY KEY,
     user_id TEXT NOT NULL,
     name TEXT,
     model TEXT,
@@ -108,7 +108,7 @@ CREATE TABLE IF NOT EXISTS equipment (
 );
 
 CREATE TABLE IF NOT EXISTS change_logs (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id SERIAL PRIMARY KEY,
     user_id TEXT NOT NULL,
     entity_type TEXT,
     entity_id INTEGER,
@@ -119,7 +119,7 @@ CREATE TABLE IF NOT EXISTS change_logs (
 );
 
 CREATE TABLE IF NOT EXISTS policy_applications (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id SERIAL PRIMARY KEY,
     user_task_id INTEGER NOT NULL UNIQUE,
     applied_at TEXT,
     supplement_note TEXT,
@@ -131,13 +131,13 @@ CREATE TABLE IF NOT EXISTS policy_applications (
 );
 
 CREATE TABLE IF NOT EXISTS research_runs (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id SERIAL PRIMARY KEY,
     run_at TEXT,
     source_count INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS policy_matches (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id SERIAL PRIMARY KEY,
     user_id TEXT NOT NULL,
     policy_id INTEGER NOT NULL,
     match_reason TEXT,
@@ -146,7 +146,7 @@ CREATE TABLE IF NOT EXISTS policy_matches (
 );
 
 CREATE TABLE IF NOT EXISTS notifications (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id SERIAL PRIMARY KEY,
     user_id TEXT NOT NULL,
     policy_id INTEGER,
     message TEXT,
@@ -156,7 +156,7 @@ CREATE TABLE IF NOT EXISTS notifications (
 );
 
 CREATE TABLE IF NOT EXISTS market_price_samples (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id SERIAL PRIMARY KEY,
     category TEXT NOT NULL,
     used_period_months INTEGER,
     condition TEXT,
@@ -164,7 +164,7 @@ CREATE TABLE IF NOT EXISTS market_price_samples (
 );
 
 CREATE TABLE IF NOT EXISTS policy_outcome_history (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id SERIAL PRIMARY KEY,
     policy_title TEXT,
     target_career TEXT,
     region TEXT,
@@ -174,7 +174,7 @@ CREATE TABLE IF NOT EXISTS policy_outcome_history (
 );
 
 CREATE TABLE IF NOT EXISTS marketplace_interests (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id SERIAL PRIMARY KEY,
     buyer_user_id TEXT NOT NULL,
     equipment_id INTEGER NOT NULL,
     created_at TEXT,
@@ -182,58 +182,94 @@ CREATE TABLE IF NOT EXISTS marketplace_interests (
 );
 """
 
+# 이전에 CREATE TABLE IF NOT EXISTS만으로 만들어진 기존 로컬 DB에는 새 컬럼이
+# 추가되지 않으므로, 필요한 컬럼을 여기서 보수적으로 추가한다. Postgres 9.6+가
+# 지원하는 IF NOT EXISTS 덕분에 SQLite 때처럼 컬럼 존재 여부를 먼저 조회할
+# 필요 없이 매번 그대로 실행해도 안전하다(멱등).
+MIGRATIONS = """
+ALTER TABLE task_templates ADD COLUMN IF NOT EXISTS offset_days INTEGER;
+ALTER TABLE profiles ADD COLUMN IF NOT EXISTS career_path TEXT;
+ALTER TABLE policies ADD COLUMN IF NOT EXISTS target_career TEXT;
+ALTER TABLE policies ADD COLUMN IF NOT EXISTS application_deadline TEXT;
+ALTER TABLE equipment ADD COLUMN IF NOT EXISTS category TEXT;
+ALTER TABLE equipment ADD COLUMN IF NOT EXISTS region TEXT;
+ALTER TABLE equipment ADD COLUMN IF NOT EXISTS final_price INTEGER;
+ALTER TABLE sources ADD COLUMN IF NOT EXISTS extracted_draft TEXT;
+ALTER TABLE policy_outcome_history ADD COLUMN IF NOT EXISTS user_task_id INTEGER;
+"""
+
+
+class _CompatCursor:
+    """psycopg2 커서를 sqlite3.Cursor와 같은 모양으로 감싼다 — services.py 등
+    나머지 모든 파일은 이 파일이 바뀐 걸 몰라도 되게 하기 위함(ARCHITECTURE.md
+    참고: db.py만 프레임워크/드라이버에 의존하고, 로직 계층은 conn을 인자로만
+    받는다)."""
+
+    def __init__(self, cur):
+        self._cur = cur
+        self._lastrowid = None
+
+    def fetchone(self):
+        return self._cur.fetchone()
+
+    def fetchall(self):
+        return self._cur.fetchall()
+
+    @property
+    def lastrowid(self):
+        if self._lastrowid is None:
+            row = self._cur.fetchone()
+            self._lastrowid = row["id"] if row else None
+        return self._lastrowid
+
+
+class _CompatConnection:
+    """psycopg2 커넥션을 sqlite3.Connection과 같은 인터페이스(execute/executemany/
+    commit/close)로 감싼다. 쿼리 문자열의 `?` 자리표시자는 SQL 리터럴 안에
+    바인드 자리표시자 외 용도로 쓰인 곳이 없음을 확인했으므로 `%s`로 그대로
+    치환한다. 모든 테이블의 PK 컬럼명이 `id`로 통일돼 있어, INSERT문에
+    `RETURNING id`를 자동으로 붙여 sqlite3의 `cursor.lastrowid`를 재현한다."""
+
+    def __init__(self, pg_conn):
+        self._conn = pg_conn
+
+    def execute(self, sql, params=None):
+        cur = self._conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        sql = sql.replace("?", "%s")
+        stripped = sql.lstrip().upper()
+        if stripped.startswith("INSERT") and "RETURNING" not in stripped:
+            sql += " RETURNING id"
+        # params가 빈 값(None/())이면 인자 없이 execute해야 한다 — psycopg2는
+        # params를 넘기는 순간 확장 프로토콜(단일 statement만 허용)을 쓰므로,
+        # SCHEMA/MIGRATIONS처럼 세미콜론으로 이어진 여러 statement를 한 번에
+        # 실행하는 호출(db.py 내부에서만 씀)이 깨진다.
+        if params:
+            cur.execute(sql, params)
+        else:
+            cur.execute(sql)
+        return _CompatCursor(cur)
+
+    def executemany(self, sql, seq_of_params):
+        cur = self._conn.cursor()
+        cur.executemany(sql.replace("?", "%s"), seq_of_params)
+
+    def commit(self):
+        self._conn.commit()
+
+    def rollback(self):
+        self._conn.rollback()
+
+    def close(self):
+        self._conn.close()
+
 
 def get_connection():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    return conn
+    pg_conn = psycopg2.connect(DATABASE_URL)
+    return _CompatConnection(pg_conn)
 
 
 def init_db(conn):
-    conn.executescript(SCHEMA)
+    conn.execute(SCHEMA)
     conn.commit()
-    _migrate(conn)
-
-
-def _migrate(conn):
-    """CREATE TABLE IF NOT EXISTS는 기존 테이블에 새 컬럼을 추가해주지 않으므로,
-    이미 생성된 로컬 DB에 대해 필요한 컬럼만 보수적으로 추가한다."""
-    cols = [row["name"] for row in conn.execute("PRAGMA table_info(task_templates)")]
-    if "offset_days" not in cols:
-        conn.execute("ALTER TABLE task_templates ADD COLUMN offset_days INTEGER")
-        conn.commit()
-
-    profile_cols = [row["name"] for row in conn.execute("PRAGMA table_info(profiles)")]
-    if "career_path" not in profile_cols:
-        conn.execute("ALTER TABLE profiles ADD COLUMN career_path TEXT")
-        conn.commit()
-
-    policy_cols = [row["name"] for row in conn.execute("PRAGMA table_info(policies)")]
-    if "target_career" not in policy_cols:
-        conn.execute("ALTER TABLE policies ADD COLUMN target_career TEXT")
-        conn.commit()
-    if "application_deadline" not in policy_cols:
-        conn.execute("ALTER TABLE policies ADD COLUMN application_deadline TEXT")
-        conn.commit()
-
-    equipment_cols = [row["name"] for row in conn.execute("PRAGMA table_info(equipment)")]
-    if "category" not in equipment_cols:
-        conn.execute("ALTER TABLE equipment ADD COLUMN category TEXT")
-        conn.commit()
-    if "region" not in equipment_cols:
-        conn.execute("ALTER TABLE equipment ADD COLUMN region TEXT")
-        conn.commit()
-    if "final_price" not in equipment_cols:
-        conn.execute("ALTER TABLE equipment ADD COLUMN final_price INTEGER")
-        conn.commit()
-
-    source_cols = [row["name"] for row in conn.execute("PRAGMA table_info(sources)")]
-    if "extracted_draft" not in source_cols:
-        conn.execute("ALTER TABLE sources ADD COLUMN extracted_draft TEXT")
-        conn.commit()
-
-    outcome_cols = [row["name"] for row in conn.execute("PRAGMA table_info(policy_outcome_history)")]
-    if "user_task_id" not in outcome_cols:
-        conn.execute("ALTER TABLE policy_outcome_history ADD COLUMN user_task_id INTEGER")
-        conn.commit()
+    conn.execute(MIGRATIONS)
+    conn.commit()

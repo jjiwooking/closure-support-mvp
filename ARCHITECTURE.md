@@ -47,8 +47,11 @@ python check_architecture.py
    - 프론트엔드(React/Next.js 등)가 그 API를 호출하는 구조
 2. **세션/로그인**: 지금은 `st.session_state` 기반 이름 로그인(비밀번호 없음).
    실제 서비스로 가려면 진짜 인증(세션 쿠키/JWT)으로 교체 필요.
-3. **DB**: 지금은 SQLite 한 커넥션을 프로세스 전체가 공유(`st.cache_resource`).
-   여러 서버 인스턴스/컨테이너로 확장하려면 SQLite는 동시 쓰기에 약하므로
-   Postgres 등으로 옮겨야 한다 — 이건 프레임워크 교체와 별개의 작업.
+3. **DB**: ~~SQLite~~ → **완료(Postgres로 이전함)**. `db.py`가 psycopg2로 Postgres에
+   접속하고, sqlite3.Connection과 같은 인터페이스(`execute`/`executemany`/`commit`)로
+   감싼 얇은 호환 래퍼를 제공하므로 `db.py` 외 로직 계층 파일은 전혀 수정하지 않았다.
+   로컬 개발은 `docker-compose.yml`(`docker compose up -d`)로 띄운다. 날짜/불린/JSON은
+   기존처럼 TEXT 컬럼 + Python 파싱 방식을 그대로 유지했다(엔진 교체만 하고 타입
+   개선은 하지 않음 — 필요하면 별도 작업으로 진행).
 4. **LLM 쿼터**: `llm_client.set_quota_backend()`에 새 환경에 맞는
    get/increment 함수만 넣어주면 됨(예: Redis, DB, 요청 컨텍스트 등).

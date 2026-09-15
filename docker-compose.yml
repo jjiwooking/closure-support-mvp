@@ -1,0 +1,21 @@
+# 로컬 개발용 Postgres. DATABASE_URL(.env 또는 기본값)의 자격증명과 반드시 일치시킬 것.
+# 실행: docker compose up -d / 중지: docker compose down (데이터는 volume에 남음)
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: closure
+      POSTGRES_PASSWORD: closure
+      POSTGRES_DB: closure_support
+    ports:
+      - "5432:5432"
+    volumes:
+      - closure_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U closure -d closure_support"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  closure_postgres_data:

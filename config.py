@@ -23,6 +23,12 @@ def _load_dotenv():
 
 _load_dotenv()
 
+# Postgres 연결 문자열. 기본값은 docker-compose.yml의 로컬 컨테이너 자격증명과
+# 일치한다 — `docker compose up -d`만으로 별도 설정 없이 동작한다.
+DATABASE_URL = os.environ.get(
+    "DATABASE_URL", "postgresql://closure:closure@localhost:5432/closure_support"
+)
+
 # 기업마당 지원사업정보 API 서비스키 (crtfcKey)
 BIZINFO_API_KEY = os.environ.get("BIZINFO_API_KEY")
 
