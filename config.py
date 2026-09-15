@@ -58,6 +58,22 @@ EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "gemini-embedding-001")
 # 직접 값을 채워 넣는다.
 API_SESSION_SECRET = os.environ.get("API_SESSION_SECRET") or secrets.token_hex(32)
 
+# "production"이면 세션 쿠키에 Secure 속성을 붙여 HTTPS로만 전송한다(로컬 개발은
+# 평문 HTTP라 기본값은 개발 모드로 둔다 — https_only=True면 로컬에서 로그인 자체가
+# 안 됨).
+ENVIRONMENT = os.environ.get("ENVIRONMENT", "development")
+
+# api.py CORS 허용 origin. 콤마로 구분한 목록을 .env에 넣으면 되고, 안 넣으면
+# 로컬 개발 포트(정적 서버 5500/3000) 기본값을 그대로 쓴다.
+CORS_ORIGINS = [
+    o.strip()
+    for o in os.environ.get(
+        "CORS_ORIGINS",
+        "http://localhost:5500,http://127.0.0.1:5500,http://localhost:3000,http://127.0.0.1:3000",
+    ).split(",")
+    if o.strip()
+]
+
 
 def bizinfo_configured() -> bool:
     return bool(BIZINFO_API_KEY)

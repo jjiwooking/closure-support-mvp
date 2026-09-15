@@ -10,14 +10,17 @@ supervisor_graph.py 등 로직 계층 함수는 그대로 호출만 하고 시�
 
 실행: uvicorn api:app --reload --port 8000
 """
+import logging
 import threading
+import time
+import uuid
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from typing import Literal
 
 from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
@@ -31,9 +34,12 @@ import pricing_model
 import trade_graph
 import seed
 import services
-from config import API_SESSION_SECRET
+from config import API_SESSION_SECRET, CORS_ORIGINS, ENVIRONMENT
 from llm_client import classify_product_image
 from supervisor_graph import run_supervisor
+
+logger = logging.getLogger("closure_support.api")
+logging.basicConfig(level=logging.INFO)
 
 
 # ---------- DB 연결: 요청마다 db.get_connection()/conn.close()를 부르지만,
@@ -51,7 +57,33 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="다음걸음 API", lifespan=lifespan)
+app = FastAPI(
+    title="다음걸음 API",
+    description="소상공인 폐업 지원 MVP의 FastAPI 백엔드. app.py(Streamlit)와 동일한 로직 계층을 공유한다.",
+    version="1.0.0",
+    lifespan=lifespan,
+)
+
+# ---------- 요청 로깅: 요청마다 짧은 id를 붙여 지연시간/상태코드/에러를 기록한다.
+# 지금까지는 DB 에러나 LLM 실패가 아무 흔적 없이 500/502로만 끝났다. ----------
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    request_id = uuid.uuid4().hex[:8]
+    start = time.monotonic()
+    try:
+        response = await call_next(request)
+    except Exception:
+        logger.exception("[%s] %s %s failed", request_id, request.method, request.url.path)
+        raise
+    duration_ms = round((time.monotonic() - start) * 1000)
+    logger.info(
+        "[%s] %s %s -> %s (%sms)",
+        request_id, request.method, request.url.path, response.status_code, duration_ms,
+    )
+    response.headers["X-Request-ID"] = request_id
+    return response
+
 
 # ---------- 레이트리밋: IP당 요청 빈도 제한. 로그인에 거는 이유는 DoS 방지뿐
 # 아니라, 이름만 입력하면 바로 새 사용자가 되는 인증 구조상 이름을 계속 바꿔
@@ -62,16 +94,20 @@ app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_middleware(SlowAPIMiddleware)
 
-app.add_middleware(SessionMiddleware, secret_key=API_SESSION_SECRET)
+app.add_middleware(
+    SessionMiddleware,
+    secret_key=API_SESSION_SECRET,
+    # ENVIRONMENT=production일 때만 Secure를 붙인다 — 로컬 개발은 평문 HTTP라
+    # https_only=True면 브라우저가 쿠키를 아예 안 보내 로그인 자체가 깨진다.
+    https_only=(ENVIRONMENT == "production"),
+)
 # 프론트엔드(web/)를 별도 정적 서버(다른 포트)로 띄워 쓰므로 CORS를 열어준다.
 # 쿠키 기반 세션을 쓰니 allow_credentials=True + 구체적인 origin이 필요하다
-# (와일드카드 "*"는 credentials와 함께 쓸 수 없음).
+# (와일드카드 "*"는 credentials와 함께 쓸 수 없음). 허용 origin은 config.py의
+# CORS_ORIGINS(.env로 배포 환경마다 다르게 설정 가능)를 그대로 쓴다.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5500", "http://127.0.0.1:5500",
-        "http://localhost:3000", "http://127.0.0.1:3000",
-    ],
+    allow_origins=CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -158,7 +194,7 @@ def get_current_user(request: Request) -> str:
 
 
 class LoginRequest(BaseModel):
-    name: str
+    name: str = Field(max_length=50)
 
 
 class UserOut(BaseModel):
@@ -248,10 +284,13 @@ class TaskOut(BaseModel):
 
 @app.get("/tasks", response_model=list[TaskOut])
 def list_tasks(
-    stage: str | None = None, user_id: str = Depends(get_current_user), conn=Depends(get_db)
+    stage: str | None = None, limit: int = 100, offset: int = 0,
+    user_id: str = Depends(get_current_user), conn=Depends(get_db)
 ):
+    limit = max(1, min(limit, 200))
+    offset = max(0, offset)
     tasks = _get_tasks(conn, user_id, stage)
-    return [TaskOut(**t) for t in tasks]
+    return [TaskOut(**t) for t in tasks[offset : offset + limit]]
 
 
 TASK_STATUS_OPTIONS = ["시작 전", "진행 중", "확인 필요", "사용자 완료"]
@@ -278,7 +317,7 @@ def update_task(
 
 class ChatRequest(BaseModel):
     stage_key: str
-    question: str
+    question: str = Field(max_length=1000)
 
 
 class ChatResponse(BaseModel):
@@ -322,7 +361,12 @@ class PolicyOut(BaseModel):
 
 
 @app.get("/policies", response_model=list[PolicyOut])
-def list_policies(user_id: str = Depends(get_current_user), conn=Depends(get_db)):
+def list_policies(
+    limit: int = 50, offset: int = 0,
+    user_id: str = Depends(get_current_user), conn=Depends(get_db),
+):
+    limit = max(1, min(limit, 200))
+    offset = max(0, offset)
     profile = _get_profile(conn, user_id)
     rows = conn.execute(
         """
@@ -335,6 +379,9 @@ def list_policies(user_id: str = Depends(get_current_user), conn=Depends(get_db)
     policies = services.sort_policies_by_deadline(
         services.filter_policies_by_career(policies, profile.get("career_path"))
     )
+    # 마감일 정렬은 반드시 전체 목록에 대해 먼저 끝내야 하므로, 페이지 자르기는
+    # 정렬 이후 이 자리에서 한다(먼저 자르면 마감 임박순이 깨질 수 있음).
+    policies = policies[offset : offset + limit]
 
     out = []
     for p in policies:
@@ -360,15 +407,15 @@ CONDITION_OPTIONS = ["상", "중", "하"]
 
 
 class EquipmentCreate(BaseModel):
-    name: str
+    name: str = Field(max_length=100)
     category: str
-    model: str | None = None
-    used_period: str | None = None
+    model: str | None = Field(default=None, max_length=200)
+    used_period: str | None = Field(default=None, max_length=50)
     condition: str
-    defects: str | None = None
+    defects: str | None = Field(default=None, max_length=500)
     ownership_status: str = "본인 소유"
-    asking_price: str | None = None
-    pickup_terms: str | None = None
+    asking_price: str | None = Field(default=None, max_length=50)
+    pickup_terms: str | None = Field(default=None, max_length=200)
 
 
 class EquipmentOut(BaseModel):
@@ -411,8 +458,13 @@ def _equipment_out(conn, row: dict, interest_count: int | None = None) -> Equipm
 
 
 @app.get("/equipment", response_model=list[EquipmentOut])
-def list_equipment(user_id: str = Depends(get_current_user), conn=Depends(get_db)):
-    rows = services.get_user_equipment(conn, user_id)
+def list_equipment(
+    limit: int = 100, offset: int = 0,
+    user_id: str = Depends(get_current_user), conn=Depends(get_db),
+):
+    limit = max(1, min(limit, 200))
+    offset = max(0, offset)
+    rows = services.get_user_equipment(conn, user_id)[offset : offset + limit]
     # 물품마다 get_equipment_interests()를 따로 부르면 N+1 쿼리이므로, 목록 화면에선
     # 개수만 한 번에 모아온다(항목 하나만 다루는 create/update 쪽은 그대로 둬도 N+1이 아님).
     counts = services.get_interest_counts(conn, [r["id"] for r in rows])
@@ -510,7 +562,7 @@ def generate_equipment_listing(
 
 
 class SaleRequest(BaseModel):
-    price_text: str
+    price_text: str = Field(max_length=50)
 
 
 @app.post("/equipment/{equipment_id}/sale", response_model=OkOut)
@@ -548,13 +600,19 @@ def list_marketplace(
     category: str | None = None,
     region: str | None = None,
     business_type: str | None = None,
+    limit: int = 50, offset: int = 0,
     user_id: str = Depends(get_current_user), conn=Depends(get_db),
 ):
+    limit = max(1, min(limit, 200))
+    offset = max(0, offset)
     listings = services.get_marketplace_listings(conn, category=category, region=region)
     if business_type:
         listings = sorted(
             listings, key=lambda it: analytics.score_equipment_match(it, business_type), reverse=True
         )
+    # 정렬 이후, 그리고 물품마다 시세 예측(KNN)을 돌리기 전에 페이지를 잘라서
+    # 어차피 응답에 안 나갈 항목의 예측 계산을 건너뛴다.
+    listings = listings[offset : offset + limit]
 
     samples_by_category: dict[str, list] = {}
     out = []
@@ -636,5 +694,6 @@ def analyze_equipment_photo(
         raise HTTPException(status_code=413, detail="이미지 파일이 너무 큽니다(최대 8MB).")
     result = classify_product_image(image_bytes, mime_type)
     if not result["ok"]:
+        logger.warning("photo-analysis failed for user=%s: %s", user_id, result["error"])
         raise HTTPException(status_code=502, detail=f"사진 분석에 실패했습니다: {result['error']}")
     return PhotoAnalysisOut(text=result["text"])

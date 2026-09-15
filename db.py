@@ -221,6 +221,43 @@ CREATE INDEX IF NOT EXISTS idx_marketplace_interests_buyer_user_id ON marketplac
 CREATE INDEX IF NOT EXISTS idx_market_price_samples_category ON market_price_samples(category);
 """
 
+# 상태값 컬럼은 지금까지 코드(services.py/app.py/api.py)의 문자열 비교에만 기대어
+# 유효값을 지켜왔다 — 오타나 새 경로가 이상한 값을 넣어도 DB는 그냥 받아준다.
+# Postgres는 ALTER TABLE ADD CONSTRAINT에 IF NOT EXISTS를 지원하지 않으므로,
+# DO 블록 + duplicate_object 예외 무시로 멱등하게 만든다(이미 있으면 조용히 통과).
+# 여기 나열한 값은 실제 코드에서 쓰는 값만 grep으로 확인해 그대로 옮겼다.
+CONSTRAINTS = """
+DO $$ BEGIN
+    ALTER TABLE equipment ADD CONSTRAINT chk_equipment_status
+        CHECK (status IN ('보관 중', '판매 중', '예약', '처분 완료'));
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
+DO $$ BEGIN
+    ALTER TABLE equipment ADD CONSTRAINT chk_equipment_payment_status
+        CHECK (payment_status IN ('미입금', '입금 완료'));
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
+DO $$ BEGIN
+    ALTER TABLE user_tasks ADD CONSTRAINT chk_user_tasks_status
+        CHECK (status IN ('시작 전', '진행 중', '확인 필요', '사용자 완료'));
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
+DO $$ BEGIN
+    ALTER TABLE policy_applications ADD CONSTRAINT chk_policy_applications_decision_status
+        CHECK (decision_status IN ('결과 대기', '승인', '불승인', '확인 필요'));
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
+DO $$ BEGIN
+    ALTER TABLE policy_applications ADD CONSTRAINT chk_policy_applications_payment_status
+        CHECK (payment_status IN ('미입금', '입금 완료'));
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
+DO $$ BEGIN
+    ALTER TABLE sources ADD CONSTRAINT chk_sources_review_status
+        CHECK (review_status IN ('검토 필요', '검토완료'));
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+"""
+
 
 class _CompatCursor:
     """psycopg2 커서를 sqlite3.Cursor와 같은 모양으로 감싼다 — services.py 등
@@ -346,4 +383,6 @@ def init_db(conn):
     conn.execute(MIGRATIONS)
     conn.commit()
     conn.execute(INDEXES)
+    conn.commit()
+    conn.execute(CONSTRAINTS)
     conn.commit()
