@@ -1,5 +1,8 @@
+import threading
+
 import psycopg2
 import psycopg2.extras
+import psycopg2.pool
 
 from config import DATABASE_URL
 
@@ -198,6 +201,26 @@ ALTER TABLE sources ADD COLUMN IF NOT EXISTS extracted_draft TEXT;
 ALTER TABLE policy_outcome_history ADD COLUMN IF NOT EXISTS user_task_id INTEGER;
 """
 
+# 자주 필터링/조인되는 컬럼에 인덱스를 추가한다(DB 리뷰에서 지적됨 — SQLite 때는
+# 데이터가 적어 체감되지 않았지만 Postgres에서 seq scan이 쌓이면 느려진다).
+INDEXES = """
+CREATE INDEX IF NOT EXISTS idx_profiles_user_id ON profiles(user_id);
+CREATE INDEX IF NOT EXISTS idx_equipment_user_id ON equipment(user_id);
+CREATE INDEX IF NOT EXISTS idx_equipment_status ON equipment(status);
+CREATE INDEX IF NOT EXISTS idx_user_tasks_user_id ON user_tasks(user_id);
+CREATE INDEX IF NOT EXISTS idx_user_tasks_template_id ON user_tasks(template_id);
+CREATE INDEX IF NOT EXISTS idx_user_tasks_policy_id ON user_tasks(policy_id);
+CREATE INDEX IF NOT EXISTS idx_change_logs_user_id ON change_logs(user_id);
+CREATE INDEX IF NOT EXISTS idx_policy_matches_user_id ON policy_matches(user_id);
+CREATE INDEX IF NOT EXISTS idx_policy_matches_policy_id ON policy_matches(policy_id);
+CREATE INDEX IF NOT EXISTS idx_notifications_user_id ON notifications(user_id);
+CREATE INDEX IF NOT EXISTS idx_document_checks_user_task_id ON document_checks(user_task_id);
+CREATE INDEX IF NOT EXISTS idx_policies_source_id ON policies(source_id);
+CREATE INDEX IF NOT EXISTS idx_marketplace_interests_equipment_id ON marketplace_interests(equipment_id);
+CREATE INDEX IF NOT EXISTS idx_marketplace_interests_buyer_user_id ON marketplace_interests(buyer_user_id);
+CREATE INDEX IF NOT EXISTS idx_market_price_samples_category ON market_price_samples(category);
+"""
+
 
 class _CompatCursor:
     """psycopg2 커서를 sqlite3.Cursor와 같은 모양으로 감싼다 — services.py 등
@@ -232,52 +255,88 @@ class _CompatConnection:
 
     def __init__(self, pg_conn):
         self._conn = pg_conn
+        # app.py는 Streamlit 프로세스 전체가 이 커넥션 하나를 공유한다(여러
+        # 세션이 각자 스레드에서 동시에 실행됨). psycopg2 커넥션 하나를 여러
+        # 스레드가 동시에 쓰면 "another command is already in progress" 같은
+        # 에러나 응답 뒤섞임이 날 수 있어, 모든 연산을 이 락으로 직렬화한다.
+        # api.py는 요청마다 별도 커넥션을 풀에서 꺼내 쓰므로 경합이 없어
+        # 이 락은 사실상 오버헤드가 없다.
+        self._lock = threading.RLock()
 
     def execute(self, sql, params=None):
-        cur = self._conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        sql = sql.replace("?", "%s")
-        stripped = sql.lstrip().upper()
-        if stripped.startswith("INSERT") and "RETURNING" not in stripped:
-            sql += " RETURNING id"
-        try:
-            # params가 빈 값(None/())이면 인자 없이 execute해야 한다 — psycopg2는
-            # params를 넘기는 순간 확장 프로토콜(단일 statement만 허용)을 쓰므로,
-            # SCHEMA/MIGRATIONS처럼 세미콜론으로 이어진 여러 statement를 한 번에
-            # 실행하는 호출(db.py 내부에서만 씀)이 깨진다.
-            if params:
-                cur.execute(sql, params)
-            else:
-                cur.execute(sql)
-        except Exception:
-            # Postgres는 SQLite와 달리 statement 하나가 실패하면 커넥션 전체가
-            # "실패한 트랜잭션" 상태로 잠기고, rollback() 전까지 이후 모든 쿼리가
-            # 에러난다. app.py는 프로세스 전체가 커넥션 하나를 공유하므로, 이걸
-            # 안 하면 한 사용자의 실패한 요청이 재시작 전까지 전체 서비스를
-            # 마비시킨다(실제로 재현 가능한 회귀였음).
-            self._conn.rollback()
-            raise
-        return _CompatCursor(cur)
+        with self._lock:
+            cur = self._conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            sql = sql.replace("?", "%s")
+            stripped = sql.lstrip().upper()
+            if stripped.startswith("INSERT") and "RETURNING" not in stripped:
+                sql += " RETURNING id"
+            try:
+                # params가 빈 값(None/())이면 인자 없이 execute해야 한다 — psycopg2는
+                # params를 넘기는 순간 확장 프로토콜(단일 statement만 허용)을 쓰므로,
+                # SCHEMA/MIGRATIONS처럼 세미콜론으로 이어진 여러 statement를 한 번에
+                # 실행하는 호출(db.py 내부에서만 씀)이 깨진다.
+                if params:
+                    cur.execute(sql, params)
+                else:
+                    cur.execute(sql)
+            except Exception:
+                # Postgres는 SQLite와 달리 statement 하나가 실패하면 커넥션 전체가
+                # "실패한 트랜잭션" 상태로 잠기고, rollback() 전까지 이후 모든 쿼리가
+                # 에러난다. app.py는 프로세스 전체가 커넥션 하나를 공유하므로, 이걸
+                # 안 하면 한 사용자의 실패한 요청이 재시작 전까지 전체 서비스를
+                # 마비시킨다(실제로 재현 가능한 회귀였음).
+                self._conn.rollback()
+                raise
+            return _CompatCursor(cur)
 
     def executemany(self, sql, seq_of_params):
-        cur = self._conn.cursor()
-        try:
-            cur.executemany(sql.replace("?", "%s"), seq_of_params)
-        except Exception:
-            self._conn.rollback()
-            raise
+        with self._lock:
+            cur = self._conn.cursor()
+            try:
+                cur.executemany(sql.replace("?", "%s"), seq_of_params)
+            except Exception:
+                self._conn.rollback()
+                raise
 
     def commit(self):
-        self._conn.commit()
+        with self._lock:
+            self._conn.commit()
 
     def rollback(self):
-        self._conn.rollback()
+        with self._lock:
+            self._conn.rollback()
 
     def close(self):
-        self._conn.close()
+        # 실제로 TCP 연결을 끊지 않고 풀에 반납한다(app.py/api.py는 여전히
+        # get_connection()/.close()만 알면 되고, 풀 존재 자체를 몰라도 된다).
+        # 반납 전에 rollback으로 커넥션을 깨끗한 상태로 되돌린다 — 호출부가
+        # commit()을 깜빡했더라도 다음에 이 커넥션을 받는 쪽이 이전 요청의
+        # 미완료 트랜잭션을 물려받지 않게 하기 위함.
+        with self._lock:
+            try:
+                self._conn.rollback()
+            except Exception:
+                pass
+        _get_pool().putconn(self._conn)
+
+
+_pool = None
+_pool_init_lock = threading.Lock()
+
+
+def _get_pool():
+    global _pool
+    if _pool is None:
+        with _pool_init_lock:
+            if _pool is None:
+                # api.py는 요청마다 커넥션 하나를 빌렸다 반납하고, app.py는
+                # 하나를 영구히 들고 있는다 — 20이면 둘 다 충분한 여유.
+                _pool = psycopg2.pool.ThreadedConnectionPool(1, 20, DATABASE_URL)
+    return _pool
 
 
 def get_connection():
-    pg_conn = psycopg2.connect(DATABASE_URL)
+    pg_conn = _get_pool().getconn()
     return _CompatConnection(pg_conn)
 
 
@@ -285,4 +344,6 @@ def init_db(conn):
     conn.execute(SCHEMA)
     conn.commit()
     conn.execute(MIGRATIONS)
+    conn.commit()
+    conn.execute(INDEXES)
     conn.commit()

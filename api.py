@@ -18,6 +18,10 @@ from typing import Literal
 from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
+from slowapi.util import get_remote_address
 from starlette.middleware.sessions import SessionMiddleware
 
 import analytics
@@ -32,14 +36,12 @@ from llm_client import classify_product_image
 from supervisor_graph import run_supervisor
 
 
-# ---------- DB 연결: 요청마다 새 연결을 열고 끝나면 닫는다. 처음엔 Streamlit의
-# st.cache_resource처럼 연결 하나를 앱 시작 시 만들어 계속 재사용했는데, 이 파일의
-# 라우트는 전부 동기 def라 FastAPI가 각 요청을 스레드풀의 서로 다른 스레드에서
-# 돌린다 — sqlite3 연결 하나를 여러 스레드가 동시에 쓰면(check_same_thread=False로
-# 에러는 안 나도) 요청끼리 커밋되지 않은 쓰기 상태를 공유하게 되어, 한 요청의
-# 절반만 끝난 트랜잭션을 다른 요청이 보거나 뒤섞일 수 있다. SQLite 연결은 열고
-# 닫는 비용이 작으니 요청마다 새로 여는 쪽이 안전하다. 동시 "쓰기" 자체의 처리량
-# 한계(파일 잠금)는 별도 작업(Postgres 마이그레이션)에서 다룬다. ----------
+# ---------- DB 연결: 요청마다 db.get_connection()/conn.close()를 부르지만,
+# Postgres 마이그레이션 이후로는 db.py 내부에서 커넥션 풀(ThreadedConnectionPool)이
+# 빌려주고 반납받는 방식으로 바뀌었다 — 이 파일은 그 사실을 몰라도 되고 코드도
+# 그대로다(get_connection()/close() 시그니처 유지). 요청마다 매번 새 TCP
+# 연결을 맺지 않아 트래픽이 몰려도 Postgres max_connections를 고갈시키지
+# 않는다. ----------
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -50,6 +52,16 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="다음걸음 API", lifespan=lifespan)
+
+# ---------- 레이트리밋: IP당 요청 빈도 제한. 로그인에 거는 이유는 DoS 방지뿐
+# 아니라, 이름만 입력하면 바로 새 사용자가 되는 인증 구조상 이름을 계속 바꿔
+# 재로그인하면 LLM 쿼터(user_id별 카운터)가 무한히 리셋되는 문제를 함께
+# 완화하기 위함이다(근본 해결은 실제 인증 도입, 이건 그 전까지의 완화책). ----------
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+app.add_middleware(SlowAPIMiddleware)
+
 app.add_middleware(SessionMiddleware, secret_key=API_SESSION_SECRET)
 # 프론트엔드(web/)를 별도 정적 서버(다른 포트)로 띄워 쓰므로 CORS를 열어준다.
 # 쿠키 기반 세션을 쓰니 allow_credentials=True + 구체적인 origin이 필요하다
@@ -154,6 +166,7 @@ class UserOut(BaseModel):
 
 
 @app.post("/auth/login", response_model=UserOut)
+@limiter.limit("10/minute")
 def login(body: LoginRequest, request: Request, conn=Depends(get_db)):
     cleaned = body.name.strip()
     if not cleaned:
@@ -241,6 +254,9 @@ def list_tasks(
     return [TaskOut(**t) for t in tasks]
 
 
+TASK_STATUS_OPTIONS = ["시작 전", "진행 중", "확인 필요", "사용자 완료"]
+
+
 class TaskUpdate(BaseModel):
     status: str
 
@@ -249,6 +265,8 @@ class TaskUpdate(BaseModel):
 def update_task(
     task_id: int, body: TaskUpdate, user_id: str = Depends(get_current_user), conn=Depends(get_db)
 ):
+    if body.status not in TASK_STATUS_OPTIONS:
+        raise HTTPException(status_code=422, detail=f"status는 {TASK_STATUS_OPTIONS} 중 하나여야 합니다.")
     ok = services.update_task_status(conn, task_id, body.status, user_id)
     if not ok:
         raise HTTPException(status_code=404, detail="업무를 찾을 수 없습니다.")
@@ -270,8 +288,9 @@ class ChatResponse(BaseModel):
 
 
 @app.post("/chat", response_model=ChatResponse)
+@limiter.limit("20/minute")
 def chat(
-    body: ChatRequest, user_id: str = Depends(get_current_user), conn=Depends(get_db)
+    request: Request, body: ChatRequest, user_id: str = Depends(get_current_user), conn=Depends(get_db)
 ):
     _bind_quota_user(user_id)
     tasks = _get_tasks(conn, user_id, body.stage_key)
@@ -429,6 +448,10 @@ def create_equipment(
     return _equipment_out(conn, row)
 
 
+EQUIPMENT_STATUS_OPTIONS = ["보관 중", "판매 중", "예약", "처분 완료"]
+PAYMENT_STATUS_OPTIONS = ["미입금", "입금 완료"]
+
+
 class EquipmentStatusUpdate(BaseModel):
     status: str | None = None
     payment_status: str | None = None
@@ -439,6 +462,10 @@ def update_equipment(
     equipment_id: int, body: EquipmentStatusUpdate,
     user_id: str = Depends(get_current_user), conn=Depends(get_db),
 ):
+    if body.status is not None and body.status not in EQUIPMENT_STATUS_OPTIONS:
+        raise HTTPException(status_code=422, detail=f"status는 {EQUIPMENT_STATUS_OPTIONS} 중 하나여야 합니다.")
+    if body.payment_status is not None and body.payment_status not in PAYMENT_STATUS_OPTIONS:
+        raise HTTPException(status_code=422, detail=f"payment_status는 {PAYMENT_STATUS_OPTIONS} 중 하나여야 합니다.")
     row = _get_own_equipment(conn, equipment_id, user_id)
     if body.status is not None:
         services.log_change(conn, user_id, "equipment", equipment_id, row["status"], body.status)
@@ -463,8 +490,9 @@ class ListingResponse(BaseModel):
 
 
 @app.post("/equipment/{equipment_id}/listing", response_model=ListingResponse)
+@limiter.limit("20/minute")
 def generate_equipment_listing(
-    equipment_id: int, body: ListingRequest,
+    request: Request, equipment_id: int, body: ListingRequest,
     user_id: str = Depends(get_current_user), conn=Depends(get_db),
 ):
     _bind_quota_user(user_id)
@@ -577,6 +605,7 @@ def express_interest(
 # 매어두지 않는 독립 엔드포인트다(app.py도 물품 등록 전 참고용으로만 쓴다). ----------
 
 ALLOWED_PHOTO_TYPES = {"image/jpeg", "image/png"}
+MAX_PHOTO_BYTES = 8 * 1024 * 1024  # 8MB
 
 
 class PhotoAnalysisOut(BaseModel):
@@ -584,8 +613,9 @@ class PhotoAnalysisOut(BaseModel):
 
 
 @app.post("/equipment/photo-analysis", response_model=PhotoAnalysisOut)
+@limiter.limit("20/minute")
 def analyze_equipment_photo(
-    photo: UploadFile = File(...), user_id: str = Depends(get_current_user)
+    request: Request, photo: UploadFile = File(...), user_id: str = Depends(get_current_user)
 ):
     # 이 파일의 다른 엔드포인트처럼 일부러 async def가 아닌 일반 def로 둔다 —
     # classify_product_image()가 내부에서 urllib.request.urlopen()을 동기(blocking)로
@@ -598,7 +628,12 @@ def analyze_equipment_photo(
     mime_type = photo.content_type or "image/jpeg"
     if mime_type not in ALLOWED_PHOTO_TYPES:
         raise HTTPException(status_code=422, detail="JPG 또는 PNG 이미지만 지원합니다.")
-    image_bytes = photo.file.read()
+    # 크기를 확인하지 않고 통째로 read()하면 큰 파일(또는 동시 다발 업로드)이
+    # 워커 메모리를 고갈시킬 수 있어, 상한+1바이트만 읽어 초과 여부를 판단한다
+    # (전체를 다 읽은 뒤에 검사하면 이미 메모리엔 다 올라온 뒤라 의미가 없다).
+    image_bytes = photo.file.read(MAX_PHOTO_BYTES + 1)
+    if len(image_bytes) > MAX_PHOTO_BYTES:
+        raise HTTPException(status_code=413, detail="이미지 파일이 너무 큽니다(최대 8MB).")
     result = classify_product_image(image_bytes, mime_type)
     if not result["ok"]:
         raise HTTPException(status_code=502, detail=f"사진 분석에 실패했습니다: {result['error']}")
