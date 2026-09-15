@@ -239,19 +239,32 @@ class _CompatConnection:
         stripped = sql.lstrip().upper()
         if stripped.startswith("INSERT") and "RETURNING" not in stripped:
             sql += " RETURNING id"
-        # params가 빈 값(None/())이면 인자 없이 execute해야 한다 — psycopg2는
-        # params를 넘기는 순간 확장 프로토콜(단일 statement만 허용)을 쓰므로,
-        # SCHEMA/MIGRATIONS처럼 세미콜론으로 이어진 여러 statement를 한 번에
-        # 실행하는 호출(db.py 내부에서만 씀)이 깨진다.
-        if params:
-            cur.execute(sql, params)
-        else:
-            cur.execute(sql)
+        try:
+            # params가 빈 값(None/())이면 인자 없이 execute해야 한다 — psycopg2는
+            # params를 넘기는 순간 확장 프로토콜(단일 statement만 허용)을 쓰므로,
+            # SCHEMA/MIGRATIONS처럼 세미콜론으로 이어진 여러 statement를 한 번에
+            # 실행하는 호출(db.py 내부에서만 씀)이 깨진다.
+            if params:
+                cur.execute(sql, params)
+            else:
+                cur.execute(sql)
+        except Exception:
+            # Postgres는 SQLite와 달리 statement 하나가 실패하면 커넥션 전체가
+            # "실패한 트랜잭션" 상태로 잠기고, rollback() 전까지 이후 모든 쿼리가
+            # 에러난다. app.py는 프로세스 전체가 커넥션 하나를 공유하므로, 이걸
+            # 안 하면 한 사용자의 실패한 요청이 재시작 전까지 전체 서비스를
+            # 마비시킨다(실제로 재현 가능한 회귀였음).
+            self._conn.rollback()
+            raise
         return _CompatCursor(cur)
 
     def executemany(self, sql, seq_of_params):
         cur = self._conn.cursor()
-        cur.executemany(sql.replace("?", "%s"), seq_of_params)
+        try:
+            cur.executemany(sql.replace("?", "%s"), seq_of_params)
+        except Exception:
+            self._conn.rollback()
+            raise
 
     def commit(self):
         self._conn.commit()
