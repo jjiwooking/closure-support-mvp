@@ -1,23 +1,21 @@
 """
-공공데이터포털(data.go.kr) 지원정책 API 호출 뼈대.
+공공데이터포털(data.go.kr, odcloud) "대한민국 공공서비스 정보" API 호출
+(Swagger: https://infuser.odcloud.kr/api/stages/44436/api-docs 기준).
 
 bizinfo_client.py와 같은 원칙: 키가 없으면 호출을 시도하지 않고 그 사실을 명확히
 반환하며, 확인되지 않은 데이터를 지어내지 않는다.
-
-주의: data.go.kr은 "활용신청"한 API마다 서로 다른 엔드포인트/서비스키를 발급한다.
-지금 이 파일은 어떤 구체적인 지원정책 API를 신청했는지(엔드포인트 경로, 요청
-파라미터명, 응답 필드명)가 아직 확인되지 않아 실제 호출부를 채우지 않았다.
-URL을 추측해 넣지 않는다 — data.go.kr 마이페이지의 "개발계정 상세보기"에서 발급된
-End Point와 활용가이드(Swagger/명세서)를 확인한 뒤 DATAGO_ENDPOINT와 요청/응답
-처리 로직을 bizinfo_client.py 패턴대로 채워 넣으면 된다.
 """
+import json
+import urllib.error
+import urllib.parse
+import urllib.request
+
 from config import DATA_GO_KR_API_KEY, datago_configured
 
-# TODO: data.go.kr에서 실제 활용신청한 지원정책 API의 End Point로 교체.
-DATAGO_ENDPOINT = None
+DATAGO_ENDPOINT = "https://api.odcloud.kr/api/gov24/v3/serviceList"
 
 
-def fetch_datago_policies(keyword: str = "폐업", page: int = 1) -> dict:
+def fetch_datago_policies(keyword: str = "폐업", page: int = 1, per_page: int = 10) -> dict:
     """반환 형식: {"configured": bool, "items": list[dict], "message": str | None}"""
     if not datago_configured():
         return {
@@ -26,18 +24,28 @@ def fetch_datago_policies(keyword: str = "폐업", page: int = 1) -> dict:
             "message": "DATA_GO_KR_API_KEY가 설정되지 않아 호출하지 않았습니다. .env.example을 참고해 키를 설정하세요.",
         }
 
-    if not DATAGO_ENDPOINT:
-        return {
-            "configured": True,
-            "items": [],
-            "message": (
-                "DATA_GO_KR_API_KEY는 설정됐지만 실제 API 엔드포인트가 아직 "
-                "채워지지 않았습니다. data.go.kr에서 활용신청한 지원정책 API의 "
-                "End Point/명세를 확인해 datago_client.py의 DATAGO_ENDPOINT와 "
-                "호출 로직을 채워주세요."
-            ),
-        }
+    params = {
+        "page": page,
+        "perPage": per_page,
+        "returnType": "JSON",
+        "cond[서비스명::LIKE]": keyword,
+    }
+    url = f"{DATAGO_ENDPOINT}?{urllib.parse.urlencode(params)}"
+    req = urllib.request.Request(url, headers={"Authorization": f"Infuser {DATA_GO_KR_API_KEY}"})
 
-    # TODO: 실제 엔드포인트가 정해지면 bizinfo_client.fetch_bizinfo_policies처럼
-    # urllib.request로 호출하고, 응답 필드명을 검증한 뒤에만 매핑한다.
-    raise NotImplementedError("DATAGO_ENDPOINT 확정 후 구현 필요")
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            body = resp.read()
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        return {"configured": True, "items": [], "message": f"API 호출 실패({exc.code}): {detail}"}
+    except urllib.error.URLError as exc:
+        return {"configured": True, "items": [], "message": f"API 호출 실패: {exc}"}
+
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError as exc:
+        return {"configured": True, "items": [], "message": f"응답 파싱 실패(필드명 확인 필요): {exc}"}
+
+    items = payload.get("data", [])
+    return {"configured": True, "items": items, "message": None}

@@ -32,8 +32,7 @@ DATABASE_URL = os.environ.get(
 # 기업마당 지원사업정보 API 서비스키 (crtfcKey)
 BIZINFO_API_KEY = os.environ.get("BIZINFO_API_KEY")
 
-# 공공데이터포털(data.go.kr) 지원정책 API 서비스키. 실제 엔드포인트는
-# datago_client.py에 아직 채워지지 않았으니 키만 넣어서는 동작하지 않는다.
+# 공공데이터포털(data.go.kr, odcloud) "대한민국 공공서비스 정보" API 일반 인증키
 DATA_GO_KR_API_KEY = os.environ.get("DATA_GO_KR_API_KEY")
 
 # 제품안전정보센터(safetykorea.kr) 인증정보 조회 API 서비스키. 사진 인식이 아니라
