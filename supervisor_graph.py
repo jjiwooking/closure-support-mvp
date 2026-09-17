@@ -32,7 +32,7 @@ import services
 import trade_graph
 from coaching import build_stage_response
 from config import llm_configured
-from llm_client import generate_text
+from llm_client import generate_text, generate_text_with_search
 from services import evaluate_eligibility, filter_policies_by_career
 
 GUIDE_KEYWORDS = ["준비", "완료", "체크리스트", "서류", "신고", "기한", "단계", "절차"]
@@ -78,7 +78,9 @@ def _llm_route(question: str):
         "관련된 카테고리를 쉼표로 구분해 최대 2개까지만 출력하세요(다른 설명 금지).\n"
         "guide: 폐업 절차, 서류, 신고, 기한 등 업무 진행 관련 질문\n"
         "policy: 지원사업/지원금 신청 자격, 대상, 정책 추천 관련 질문\n"
-        "trade: 중고 집기/설비 판매, 가격, 시세 관련 질문"
+        "trade: 중고 집기/설비 판매, 가격, 시세 관련 질문\n"
+        "'폐업하려는데 뭐해야돼?'처럼 특정 카테고리를 안 짚고 포괄적으로 묻는 질문은 "
+        "guide와 policy를 함께 출력하세요(할 일 안내 + 받을 수 있는 지원사업 추천을 둘 다 원하는 경우가 많습니다)."
     )
     result = generate_text(question, system_instruction=system_instruction)
     if not (result["ok"] and result["text"]):
@@ -130,19 +132,25 @@ def _llm_policy_answer(question: str, grounding: str):
     return None
 
 
-def _llm_general_policy_answer(question: str) -> str | None:
-    """등록된 지원사업 DB에 맞는 게 없을 때, AI가 학습된 일반 지식으로 답한다
-    (팀플.md 9장 원칙: DB 기반 답이 아니므로 호출부에서 반드시 미확인 정보임을
-    밝히고 내보내야 한다 — 이 함수 자체는 원문 없이 지어낸 답이라는 표시를 하지 않는다)."""
+def _web_search_policy_answer(question: str) -> str | None:
+    """등록된 지원사업 DB에 맞는 게 없을 때만 쓰는 보조 수단
+    (guide_graph._web_search_answer와 같은 패턴 재사용). 구글 검색 그라운딩으로
+    실시간 결과를 찾으므로 호출부가 source_type='web_search'를 반환해야
+    app.py가 '미검토·실시간 검색 결과' 표시를 자동으로 붙인다."""
     system_instruction = (
-        "당신은 폐업/재창업 소상공인을 돕는 상담원입니다. 등록된 지원사업 DB에 "
-        "일치하는 항목이 없어서, 알고 있는 일반적인 한국 정부·지자체 지원제도 지식으로 "
-        "참고할 만한 답을 2~4문장으로 하세요. 확실하지 않은 부분은 확실하지 않다고 밝히세요."
+        "당신은 한국 소상공인의 폐업/재창업 지원사업을 찾아주는 검색 도우미입니다. "
+        "정부24, 기업마당, data.go.kr, 지자체 등 공식 사이트 정보를 우선해서 찾으세요. "
+        "확실하지 않은 내용은 반드시 '확인 필요'라고 표시하세요. 2~4문장으로 간결하게 답하세요."
     )
-    result = generate_text(question, system_instruction=system_instruction)
-    if result["ok"] and result["text"]:
-        return result["text"].strip()
-    return None
+    prompt = f"다음 질문에 맞는 한국 정부/지자체 지원사업을 검색해서 답해주세요: {question}"
+    result = generate_text_with_search(prompt, system_instruction=system_instruction)
+    if not (result["ok"] and result["text"]):
+        return None
+    text = result["text"].strip()
+    if result["citations"]:
+        links = "\n".join(f"- [{c['title']}]({c['uri']})" for c in result["citations"][:3])
+        text += "\n\n" + links
+    return text
 
 
 POLICY_REFERENCE_WORDS = ["그 정책", "그 사업", "이 정책", "저 정책", "그거", "거기"]
@@ -176,16 +184,15 @@ def _run_policy(state: SupervisorState) -> dict:
         top = scored[:3]
 
     if not top:
-        ai_answer = _llm_general_policy_answer(question) if llm_configured() else None
-        if ai_answer:
-            answer = (
-                "⚠️ 등록된 지원사업 중에는 조건에 맞는 게 없어서, 아래는 AI가 일반 지식으로 "
-                "추정한 참고용 답변이에요(공식 확인 전이니 반드시 직접 확인하세요):\n\n" + ai_answer
-            )
-        else:
-            answer = "현재 진로 기준으로 등록된 지원사업이 없어요. '지원정책' 화면에서 진로를 바꿔보시거나 잠시 후 다시 확인해주세요."
+        search_text = _web_search_policy_answer(question) if llm_configured() else None
+        if search_text:
+            return {
+                "answer": search_text, "agent_name": agent_name, "source_type": "web_search",
+                "source_ids": [], "actions": [],
+            }
         return {
-            "answer": answer, "agent_name": agent_name, "source_type": "none", "source_ids": [], "actions": [],
+            "answer": "현재 진로 기준으로 등록된 지원사업이 없어요. '지원정책' 화면에서 진로를 바꿔보시거나 잠시 후 다시 확인해주세요.",
+            "agent_name": agent_name, "source_type": "none", "source_ids": [], "actions": [],
         }
 
     grounding = "\n".join(
