@@ -1,6 +1,7 @@
 import json
 from datetime import date
 
+import psycopg2
 import streamlit as st
 
 from analytics import BUSINESS_TYPE_CATEGORIES, policy_approval_stats, score_equipment_match, score_policy_fit
@@ -122,7 +123,16 @@ def _get_app_connection():
     감싸 프로세스당 한 번만 실행되게 한다. 특정 사용자 데모 시드(seed_if_empty)는
     로그인 전엔 어떤 이름으로 로그인할지 알 수 없으므로 여기서 하지 않고,
     로그인 직후 별도로 호출한다."""
-    conn = get_connection()
+    try:
+        conn = get_connection()
+    except psycopg2.OperationalError:
+        st.error(
+            "데이터베이스에 연결할 수 없습니다. `DATABASE_URL`이 설정되지 않았거나 "
+            "잘못된 값입니다 (기본값은 로컬 docker-compose용 localhost 주소라 "
+            "배포 환경에서는 동작하지 않습니다). Streamlit Cloud라면 앱 Settings → "
+            "Secrets에 실제 Postgres 접속 문자열을 등록하세요."
+        )
+        st.stop()
     init_db(conn)
     return conn
 

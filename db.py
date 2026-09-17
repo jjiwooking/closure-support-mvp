@@ -300,40 +300,63 @@ class _CompatConnection:
         # 이 락은 사실상 오버헤드가 없다.
         self._lock = threading.RLock()
 
+    def _reconnect(self):
+        # app.py는 이 커넥션을 st.cache_resource로 프로세스 수명 내내 붙들고 있는다.
+        # Neon 같은 서버리스 Postgres는 유휴 커넥션을 서버 쪽에서 끊어버리므로,
+        # 다음 쿼리에서 InterfaceError/OperationalError로만 드러난다 — 죽은
+        # 커넥션은 풀에 반납하지 않고 버린 뒤 새로 하나 받는다.
+        try:
+            _get_pool().putconn(self._conn, close=True)
+        except Exception:
+            pass
+        self._conn = _get_pool().getconn()
+
     def execute(self, sql, params=None):
         with self._lock:
-            cur = self._conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
             sql = sql.replace("?", "%s")
             stripped = sql.lstrip().upper()
             if stripped.startswith("INSERT") and "RETURNING" not in stripped:
                 sql += " RETURNING id"
-            try:
-                # params가 빈 값(None/())이면 인자 없이 execute해야 한다 — psycopg2는
-                # params를 넘기는 순간 확장 프로토콜(단일 statement만 허용)을 쓰므로,
-                # SCHEMA/MIGRATIONS처럼 세미콜론으로 이어진 여러 statement를 한 번에
-                # 실행하는 호출(db.py 내부에서만 씀)이 깨진다.
-                if params:
-                    cur.execute(sql, params)
-                else:
-                    cur.execute(sql)
-            except Exception:
-                # Postgres는 SQLite와 달리 statement 하나가 실패하면 커넥션 전체가
-                # "실패한 트랜잭션" 상태로 잠기고, rollback() 전까지 이후 모든 쿼리가
-                # 에러난다. app.py는 프로세스 전체가 커넥션 하나를 공유하므로, 이걸
-                # 안 하면 한 사용자의 실패한 요청이 재시작 전까지 전체 서비스를
-                # 마비시킨다(실제로 재현 가능한 회귀였음).
-                self._conn.rollback()
-                raise
-            return _CompatCursor(cur)
+            for attempt in (1, 2):
+                try:
+                    cur = self._conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+                    # params가 빈 값(None/())이면 인자 없이 execute해야 한다 — psycopg2는
+                    # params를 넘기는 순간 확장 프로토콜(단일 statement만 허용)을 쓰므로,
+                    # SCHEMA/MIGRATIONS처럼 세미콜론으로 이어진 여러 statement를 한 번에
+                    # 실행하는 호출(db.py 내부에서만 씀)이 깨진다.
+                    if params:
+                        cur.execute(sql, params)
+                    else:
+                        cur.execute(sql)
+                    return _CompatCursor(cur)
+                except (psycopg2.InterfaceError, psycopg2.OperationalError):
+                    if attempt == 2:
+                        raise
+                    self._reconnect()
+                except Exception:
+                    # Postgres는 SQLite와 달리 statement 하나가 실패하면 커넥션 전체가
+                    # "실패한 트랜잭션" 상태로 잠기고, rollback() 전까지 이후 모든 쿼리가
+                    # 에러난다. app.py는 프로세스 전체가 커넥션 하나를 공유하므로, 이걸
+                    # 안 하면 한 사용자의 실패한 요청이 재시작 전까지 전체 서비스를
+                    # 마비시킨다(실제로 재현 가능한 회귀였음).
+                    self._conn.rollback()
+                    raise
 
     def executemany(self, sql, seq_of_params):
         with self._lock:
-            cur = self._conn.cursor()
-            try:
-                cur.executemany(sql.replace("?", "%s"), seq_of_params)
-            except Exception:
-                self._conn.rollback()
-                raise
+            sql = sql.replace("?", "%s")
+            for attempt in (1, 2):
+                try:
+                    cur = self._conn.cursor()
+                    cur.executemany(sql, seq_of_params)
+                    return
+                except (psycopg2.InterfaceError, psycopg2.OperationalError):
+                    if attempt == 2:
+                        raise
+                    self._reconnect()
+                except Exception:
+                    self._conn.rollback()
+                    raise
 
     def commit(self):
         with self._lock:
