@@ -25,6 +25,7 @@ from services import (
     log_change,
     mark_notification_read,
     priority_sort,
+    promote_source_draft,
     record_application_date,
     record_equipment_sale,
     record_marketplace_interest,
@@ -38,7 +39,6 @@ from services import (
     update_decision_status,
     update_profile,
     update_task_status,
-    validate_iso_date,
 )
 from trade_graph import run_trade
 
@@ -635,7 +635,7 @@ def screen_policies():
 
     profile = get_profile()
 
-    with st.expander("기업마당 자료 동기화 (관리자용)", expanded=False):
+    with st.expander("기업마당·data.go.kr 자료 동기화 (관리자용)", expanded=False):
         st.caption(
             "수집만 하고 자동 게시하지 않습니다. 담당자가 검토해 review_status를 "
             "'검토완료'로 바꾸기 전까지는 아래 추천 목록에 나타나지 않습니다. "
@@ -680,26 +680,7 @@ def screen_policies():
                 rules_preview = ", ".join(f"{k}={v}" for k, v in rules_guess.items())
                 st.caption(f"추정 조건: {rules_preview or '없음(등록 후 직접 보완 필요)'}")
                 if st.button("이 초안으로 정책 등록", key=f"promote_{d['id']}"):
-                    safe_deadline = validate_iso_date(draft.get("application_deadline_guess"))
-                    eligibility_rules_json = json.dumps(rules_guess, ensure_ascii=False) if rules_guess else "{}"
-                    conn.execute(
-                        """
-                        INSERT INTO policies
-                            (source_id, title, period, eligibility_rules, application_link_id,
-                             availability_status, target_career, application_deadline)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        (
-                            d["id"], draft.get("title") or "(제목 확인 필요)", "확인 필요", eligibility_rules_json,
-                            None, "모집중",
-                            draft.get("target_career_guess"), safe_deadline,
-                        ),
-                    )
-                    conn.execute(
-                        "UPDATE sources SET review_status='검토완료', reviewed_at=? WHERE id=?",
-                        (date.today().isoformat(), d["id"]),
-                    )
-                    conn.commit()
+                    promote_source_draft(conn, d["id"], draft)
                     st.success("등록되었습니다. 세부 조건은 필요 시 직접 보완하세요.")
                     st.rerun()
 

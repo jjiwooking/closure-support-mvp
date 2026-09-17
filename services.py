@@ -4,6 +4,7 @@ from datetime import date, datetime, timedelta
 
 import pricing_model
 from bizinfo_client import fetch_bizinfo_policies
+from datago_client import fetch_datago_policies
 
 _ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
@@ -266,15 +267,15 @@ def register_policy_interest(conn, policy_id, user_id):
     return new_id, True
 
 
-# ---------- 외부 자료 수집 (기업마당) — 수집만 하고 자동 게시하지 않는다 ----------
+# ---------- 외부 자료 수집 (기업마당, data.go.kr) — 수집만 하고 자동 게시하지 않는다 ----------
 
-def sync_bizinfo_policies(conn, keyword: str = "폐업") -> dict:
+def sync_bizinfo_policies(conn, keyword: str = "폐업", page_unit: int = 30) -> dict:
     """수집 -> 중복 제거까지만 수행한다. review_status='검토 필요'로 저장되며,
     지원정책 화면은 review_status='검토완료'만 보여주므로 사람이 검토·게시하기
     전에는 추천에 노출되지 않는다(팀플.md 9장 등록 흐름, 검수기준 '미확인 조건을
     신청 가능으로 확정하지 않는다' 준수). 필드명이 아직 검증되지 않아 원문을
     그대로 보존하고 조건(eligibility_rules) 추출·policies 등록은 사람이 한다."""
-    result = fetch_bizinfo_policies(keyword)
+    result = fetch_bizinfo_policies(keyword, page_unit=page_unit)
     if not result["configured"] or result["message"]:
         return result
 
@@ -299,6 +300,66 @@ def sync_bizinfo_policies(conn, keyword: str = "폐업") -> dict:
         "items": result["items"],
         "message": f"{added}건 수집해 검토 대기로 등록했습니다. (화면에는 아직 표시되지 않음)",
     }
+
+
+def sync_datago_policies(conn, keyword: str = "폐업", per_page: int = 30) -> dict:
+    """data.go.kr(공공데이터포털) 대한민국 공공서비스 정보 API 버전의
+    sync_bizinfo_policies. 같은 원칙(수집만 하고 자동 게시하지 않음)을 따른다.
+    이 API는 '서비스명'에 검색어가 포함된 경우만 찾으므로(부분일치),
+    '폐업'만으로는 대부분 0건이고 '희망리턴패키지' 같은 실제 폐업지원사업은
+    보통 '소상공인'으로 걸린다 — policy_collect가 여러 키워드를 함께 시도한다."""
+    result = fetch_datago_policies(keyword, per_page=per_page)
+    if not result["configured"] or result["message"]:
+        return result
+
+    now = datetime.utcnow().isoformat()
+    added = 0
+    for raw in result["items"]:
+        raw_json = json.dumps(raw, ensure_ascii=False)
+        existing = conn.execute("SELECT id FROM sources WHERE title=?", (raw_json,)).fetchone()
+        if existing:
+            continue
+        conn.execute(
+            """
+            INSERT INTO sources (agency, title, url, retrieved_at, reviewed_at, version, review_status)
+            VALUES (?, ?, ?, ?, NULL, 'v1', '검토 필요')
+            """,
+            ("data.go.kr(자동수집, 필드 미확인)", raw_json, "", now),
+        )
+        added += 1
+    conn.commit()
+    return {
+        "configured": True,
+        "items": result["items"],
+        "message": f"{added}건 수집해 검토 대기로 등록했습니다. (화면에는 아직 표시되지 않음)",
+    }
+
+
+def promote_source_draft(conn, source_id: int, draft: dict, title_fallback: str = "(제목 확인 필요)"):
+    """AI 구조화 초안을 사람이 검토 후 policies에 등록할 때 쓰는 공통 로직
+    (app.py 관리자 화면 버튼과 실데이터 백필 스크립트가 공유한다). source의
+    review_status를 '검토완료'로 바꿔야만 지원정책 화면에 노출된다."""
+    rules_guess = {k: v for k, v in (draft.get("eligibility_rules_guess") or {}).items() if v}
+    eligibility_rules_json = json.dumps(rules_guess, ensure_ascii=False) if rules_guess else "{}"
+    safe_deadline = validate_iso_date(draft.get("application_deadline_guess"))
+    conn.execute(
+        """
+        INSERT INTO policies
+            (source_id, title, period, eligibility_rules, application_link_id,
+             availability_status, target_career, application_deadline)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            source_id, draft.get("title") or title_fallback, "확인 필요", eligibility_rules_json,
+            None, "모집중",
+            draft.get("target_career_guess"), safe_deadline,
+        ),
+    )
+    conn.execute(
+        "UPDATE sources SET review_status='검토완료', reviewed_at=? WHERE id=?",
+        (date.today().isoformat(), source_id),
+    )
+    conn.commit()
 
 
 def log_research_run(conn, source_count: int):

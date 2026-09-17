@@ -130,6 +130,21 @@ def _llm_policy_answer(question: str, grounding: str):
     return None
 
 
+def _llm_general_policy_answer(question: str) -> str | None:
+    """등록된 지원사업 DB에 맞는 게 없을 때, AI가 학습된 일반 지식으로 답한다
+    (팀플.md 9장 원칙: DB 기반 답이 아니므로 호출부에서 반드시 미확인 정보임을
+    밝히고 내보내야 한다 — 이 함수 자체는 원문 없이 지어낸 답이라는 표시를 하지 않는다)."""
+    system_instruction = (
+        "당신은 폐업/재창업 소상공인을 돕는 상담원입니다. 등록된 지원사업 DB에 "
+        "일치하는 항목이 없어서, 알고 있는 일반적인 한국 정부·지자체 지원제도 지식으로 "
+        "참고할 만한 답을 2~4문장으로 하세요. 확실하지 않은 부분은 확실하지 않다고 밝히세요."
+    )
+    result = generate_text(question, system_instruction=system_instruction)
+    if result["ok"] and result["text"]:
+        return result["text"].strip()
+    return None
+
+
 POLICY_REFERENCE_WORDS = ["그 정책", "그 사업", "이 정책", "저 정책", "그거", "거기"]
 
 
@@ -161,9 +176,16 @@ def _run_policy(state: SupervisorState) -> dict:
         top = scored[:3]
 
     if not top:
+        ai_answer = _llm_general_policy_answer(question) if llm_configured() else None
+        if ai_answer:
+            answer = (
+                "⚠️ 등록된 지원사업 중에는 조건에 맞는 게 없어서, 아래는 AI가 일반 지식으로 "
+                "추정한 참고용 답변이에요(공식 확인 전이니 반드시 직접 확인하세요):\n\n" + ai_answer
+            )
+        else:
+            answer = "현재 진로 기준으로 등록된 지원사업이 없어요. '지원정책' 화면에서 진로를 바꿔보시거나 잠시 후 다시 확인해주세요."
         return {
-            "answer": "현재 진로 기준으로 등록된 지원사업이 없어요. '지원정책' 화면에서 진로를 바꿔보시거나 잠시 후 다시 확인해주세요.",
-            "agent_name": agent_name, "source_type": "none", "source_ids": [], "actions": [],
+            "answer": answer, "agent_name": agent_name, "source_type": "none", "source_ids": [], "actions": [],
         }
 
     grounding = "\n".join(

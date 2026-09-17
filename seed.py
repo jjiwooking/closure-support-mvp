@@ -1,4 +1,3 @@
-import json
 from datetime import date, timedelta
 
 # offset_days: 폐업 예정일로부터 며칠 전이 기한인지. due_type이 '사용자 예정일'인
@@ -44,14 +43,10 @@ def seed_if_empty(conn, user_id):
         ),
     )
 
-    source_id = conn.execute(
-        "SELECT id FROM sources WHERE title=?",
-        ("소상공인 폐업 지원 안내(시연용 예시 자료)",),
-    ).fetchone()["id"]
-    policy_id = conn.execute(
-        "SELECT id FROM policies WHERE title=?",
-        ("희망리턴패키지(시연용 예시)",),
-    ).fetchone()["id"]
+    policy_row = conn.execute(
+        "SELECT id FROM policies ORDER BY id LIMIT 1"
+    ).fetchone()
+    policy_id = policy_row["id"] if policy_row else None
 
     template_ids = [
         conn.execute(
@@ -84,8 +79,8 @@ def seed_if_empty(conn, user_id):
         task_ids.append(cur.lastrowid)
 
     doc_id = conn.execute(
-        "SELECT id FROM document_guides WHERE source_id=? AND name=?",
-        (source_id, "폐업신고서"),
+        "SELECT id FROM document_guides WHERE name=? ORDER BY id LIMIT 1",
+        ("폐업신고서",),
     ).fetchone()["id"]
 
     conn.execute(
@@ -137,24 +132,26 @@ def ensure_reference_data(conn):
         "SELECT COUNT(*) AS c FROM equipment WHERE user_id = 'demo_seller_2'"
     ).fetchone()["c"] == 0:
         _seed_marketplace_listings(conn)
-    if conn.execute("SELECT COUNT(*) AS c FROM policies").fetchone()["c"] == 0:
-        _seed_demo_policies(conn)
+    if conn.execute("SELECT COUNT(*) AS c FROM task_templates").fetchone()["c"] == 0:
+        _seed_checklist_reference_data(conn)
     _backfill_equipment_category_region(conn)
     conn.commit()
 
 
-def _seed_demo_policies(conn):
-    """지원정책 화면(screen_policies) 데모용 출처/정책/서류가이드. 모든 사용자가
-    공유하는 참고 데이터이므로 사용자별로 새로 만들지 않고 한 번만 생성한다."""
+def _seed_checklist_reference_data(conn):
+    """폐업 준비/진행/후 체크리스트(task_templates)와 서류가이드가 참조하는
+    기준 출처. 실제 지원정책 목록(policies)은 여기서 만들지 않는다 —
+    기업마당/data.go.kr API에서 수집 후 사람이 검토해 등록한다
+    (screen_policies의 '지금 리서치 실행' 참고)."""
     cur = conn.execute(
         """
         INSERT INTO sources (agency, title, url, retrieved_at, reviewed_at, version, review_status)
         VALUES (?, ?, ?, ?, ?, ?, ?)
         """,
         (
-            "서울시",
-            "소상공인 폐업 지원 안내(시연용 예시 자료)",
-            "https://example-official-site.invalid/notice-1",
+            "앱 자체 제공",
+            "폐업 준비 안내 (앱 기본 체크리스트)",
+            "",
             date.today().isoformat(),
             date.today().isoformat(),
             "v1",
@@ -165,43 +162,6 @@ def _seed_demo_policies(conn):
 
     conn.execute(
         """
-        INSERT INTO policies
-            (source_id, title, period, eligibility_rules, application_link_id, availability_status, target_career, application_deadline)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            source_id,
-            "희망리턴패키지(시연용 예시)",
-            "상시",
-            json.dumps({"region": "서울 마포구", "rent_status": "임차"}, ensure_ascii=False),
-            "policy_apply_1",
-            "모집중",
-            "공통",
-            None,
-        ),
-    )
-
-    # 진로별 필터링/마감일 정렬이 실제로 눈에 보이도록 재창업 전용 예시 정책을 하나 더 둔다.
-    conn.execute(
-        """
-        INSERT INTO policies
-            (source_id, title, period, eligibility_rules, application_link_id, availability_status, target_career, application_deadline)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            source_id,
-            "재창업 지원금(시연용 예시)",
-            (date.today() + timedelta(days=20)).isoformat() + "까지",
-            json.dumps({"region": "서울 마포구"}, ensure_ascii=False),
-            "policy_apply_2",
-            "모집중",
-            "재창업",
-            (date.today() + timedelta(days=20)).isoformat(),
-        ),
-    )
-
-    conn.execute(
-        """
         INSERT INTO document_guides (source_id, name, issuance_link_id, instructions, submission_link_id)
         VALUES (?, ?, ?, ?, ?)
         """,
@@ -209,7 +169,7 @@ def _seed_demo_policies(conn):
             source_id,
             "폐업신고서",
             "doc_issue_1",
-            "정부24에서 온라인 발급 또는 세무서 방문 발급 (시연용 예시 경로)",
+            "정부24에서 온라인 발급 또는 세무서 방문 발급",
             "doc_submit_1",
         ),
     )

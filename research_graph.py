@@ -4,10 +4,12 @@
 "지금 리서치 실행" 버튼으로 동기 실행한다(app.py의 screen_policies()에서 호출).
 
 세 에이전트로 역할을 분리한다(심사평 "에이전트별 역할 분배 고도화" 대응):
-  policy_collect  : 기업마당 API에서 원문을 수집해 sources에 '검토 필요'로 쌓는다
-                     (기존 services.sync_bizinfo_policies 그대로 재사용 — 필드가
-                     검증되지 않은 원문이라 policies로 자동 승격하지 않는다는
-                     원칙은 그대로 유지된다). 실행 로그를 research_runs에 남긴다.
+  policy_collect  : 기업마당 + data.go.kr API에서 원문을 수집해 sources에
+                     '검토 필요'로 쌓는다 (services.sync_bizinfo_policies /
+                     sync_datago_policies 재사용 — 필드가 검증되지 않은 원문이라
+                     policies로 자동 승격하지 않는다는 원칙은 그대로 유지된다).
+                     더 많이 끌어오도록 '폐업'/'소상공인'/'재창업' 키워드로
+                     두 API를 모두 훑는다. 실행 로그를 research_runs에 남긴다.
   policy_extract  : 아직 AI 초안이 없는 '검토 필요' sources를 LLM으로 구조화해
                      sources.extracted_draft에 저장만 한다. 사람이 검토 화면에서
                      초안을 확인하고 승인해야만 policies에 등록되며, 이 노드가
@@ -41,8 +43,17 @@ class ResearchState(TypedDict):
 
 def policy_collect(state: ResearchState) -> dict:
     conn = state["conn"]
-    result = services.sync_bizinfo_policies(conn, state["keyword"])
-    source_count = len(result.get("items") or [])
+    keyword = state["keyword"]
+    source_count = 0
+
+    # 두 API 모두 키워드 하나로는 놓치는 공고가 많아(특히 data.go.kr은 서비스명
+    # 부분일치라 '폐업' 단독으로는 대부분 0건) 여러 키워드로 최대한 넓게 훑는다.
+    for kw in {keyword, "소상공인", "재창업"}:
+        bizinfo_result = services.sync_bizinfo_policies(conn, kw)
+        source_count += len(bizinfo_result.get("items") or [])
+        datago_result = services.sync_datago_policies(conn, kw)
+        source_count += len(datago_result.get("items") or [])
+
     services.log_research_run(conn, source_count)
     return {"source_count": source_count}
 
